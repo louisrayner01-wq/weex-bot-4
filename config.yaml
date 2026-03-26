@@ -1,0 +1,84 @@
+# ============================================================
+#  WEEX Trading Bot — Configuration
+# ============================================================
+
+exchange:
+  api_key:     "YOUR_API_KEY"
+  api_secret:  "YOUR_SECRET_KEY"
+  passphrase:  "YOUR_PASSPHRASE"
+  base_url:    "https://api-spot.weex.com"
+
+# ── Set paper_trading: true while testing. Change to false for live. ──
+trading:
+  paper_trading: true
+  leverage: 5          # Leverage multiplier (1 = no leverage). Start low while learning.
+
+  pairs:
+    - symbol:     "BTCUSDT_SPBL"
+      name:       "BTC"
+      enabled:    true
+      allocation: 0.50       # 50 % of capital starts on BTC
+
+    - symbol:     "ETHUSDT_SPBL"
+      name:       "ETH"
+      enabled:    true
+      allocation: 0.30
+
+    - symbol:     "SOLUSDT_SPBL"
+      name:       "SOL"
+      enabled:    true
+      allocation: 0.20
+
+  timeframe:        "60"      # Candle granularity in minutes (15 / 60 / 240 / 1440)
+  lookback_candles: 300       # Candles fetched for indicator calculation
+  loop_interval_s:  3600      # Run every N seconds (3600 = 1 hour, matches timeframe)
+
+risk:
+  # Paper account = £100 equivalent in USDT
+  initial_capital:      100.0
+
+  # Risk exactly £5 per trade (absolute amount, not percentage)
+  risk_per_trade_abs:   5.0
+
+  stop_loss_atr_mult:   1.5      # Stop-loss = 1.5 × ATR
+  take_profit_atr_mult: 3.0      # Take-profit = 3 × ATR  →  2 : 1 risk-reward
+  min_rr_ratio:         1.5      # Reject any trade where actual R/R falls below 1.5
+  max_open_positions:   2        # Only 2 concurrent positions (£100 account protection)
+  max_daily_loss_abs:   10.0     # Auto-halt if we lose £10 in a single day
+
+strategy:
+  # ── Signal thresholds ──────────────────────────────────────────────────────
+  buy_threshold:    0.60   # Buy when calibrated probability > 60 %
+  sell_threshold:   0.40   # Exit when probability < 40 %
+
+  # ── Trade quality gates (BOTH must pass before entering a trade) ───────────
+  min_ev:           0.001  # Minimum Expected Value (EV > 0.1 % per trade)
+  min_win_rate:     0.45   # Need at least 45 % historical win rate before trading
+  min_ev_trades:    10     # Minimum trades before EV gate is enforced
+
+  # ── Hold / exit rules ──────────────────────────────────────────────────────
+  min_holding_candles: 2
+
+  # ── Self-improvement schedule ──────────────────────────────────────────────
+  # The bot retrains MORE FREQUENTLY early on to learn fast,
+  # then gradually slows down as its data set matures.
+  #   0–14 completed trades  →  retrain every 5
+  #  15–39 completed trades  →  retrain every 10
+  #  40–99 completed trades  →  retrain every 20
+  # 100+   completed trades  →  retrain every 40
+  retrain_stages:
+    - {after_trades:   0, retrain_every:  5}
+    - {after_trades:  15, retrain_every: 10}
+    - {after_trades:  40, retrain_every: 20}
+    - {after_trades: 100, retrain_every: 40}
+
+  # ── Labelling ──────────────────────────────────────────────────────────────
+  min_training_samples:  60    # Don't train until we have at least 60 labelled samples
+  label_horizon_candles:  4    # Look 4 candles forward to label BUY / HOLD / SELL
+  label_move_threshold: 0.005  # 0.5 % move counts as a meaningful directional move
+
+logging:
+  log_file:    "logs/bot.log"
+  trades_file: "logs/trades.csv"
+  models_dir:  "models/"
+  level:       "INFO"
