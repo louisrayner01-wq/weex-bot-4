@@ -161,9 +161,14 @@ class TradingBot:
 
         # Higher-timeframe for confluence filter
         # Analysis recommendations override this after the analysis runs
-        data_cfg      = self.cfg.get("data", {})
-        self.htf_tf   = str(data_cfg.get("confluence_timeframe", "60"))  # default 1h
+        data_cfg       = self.cfg.get("data", {})
+        self.htf_tf    = str(data_cfg.get("confluence_timeframe", "60"))  # default 1h
         self.htf_label = TF_LABELS.get(self.htf_tf, "1h")
+
+        # Lower-timeframe for reversal exit signal (1h when trading 4h)
+        tc_cfg          = self.cfg.get("trading", {})
+        self.ltf_tf     = str(tc_cfg.get("ltf_reversal_tf", "60"))
+        self.ltf_label  = TF_LABELS.get(self.ltf_tf, "1h")
 
         mode = "🟡 PAPER" if self.paper else "🔴 LIVE"
         self.log.info("%s MODE  |  Account: £%.2f  |  Risk/trade: £%.2f  |  Lev: dynamic (max %dx)",
@@ -352,6 +357,243 @@ class TradingBot:
                 n = len(df) if df is not None else 0
                 self.log.info("⚠️  Only %d candles available — model will train once data builds up.", n)
 
+    # ── LTF reversal detector ─────────────────────────────────────────────────
+
+    def _ltf_reversal(self, df_ltf: pd.DataFrame, side: str) -> bool:
+        """
+        Returns True if the lower-timeframe (1h) shows a reversal signal
+        that suggests the current trend is running out of steam.
+
+        For a LONG position (looking for bearish reversal):
+          • WaveTrend WT1 crossed BELOW WT2 while coming from positive territory, OR
+          • MACD histogram flipped from positive to negative this candle
+
+        For a SHORT position (looking for bullish reversal):
+          • WaveTrend WT1 crossed ABOVE WT2 while coming from negative territory, OR
+          • MACD histogram flipped from negative to positive
+        """
+        if df_ltf is None or len(df_ltf) < 30:
+            return False
+        try:
+            from indicators import compute_features
+            df = compute_features(df_ltf.copy())
+            if len(df) < 2:
+                return False
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            if side == "long":
+                wt_cross_bear  = float(last.get("vmcb_wt_cross_bear", 0)) == 1.0
+                wt_was_pos     = float(last.get("vmcb_wt1", 0))           >  0
+                macd_flip_bear = (float(last.get("macd_diff", 0)) < 0 and
+                                  float(prev.get("macd_diff", 0)) >= 0)
+                return (wt_cross_bear and wt_was_pos) or macd_flip_bear
+            else:
+                wt_cross_bull  = float(last.get("vmcb_wt_cross_bull", 0)) == 1.0
+                wt_was_neg     = float(last.get("vmcb_wt1", 0))           <  0
+                macd_flip_bull = (float(last.get("macd_diff", 0)) > 0 and
+                                  float(prev.get("macd_diff", 0)) <= 0)
+                return (wt_cross_bull and wt_was_neg) or macd_flip_bull
+        except Exception as exc:
+            self.log.debug("LTF reversal check error: %s", exc)
+            return False
+
+    # ── Shared entry logic ────────────────────────────────────────────────────
+
+    def _try_enter(self, symbol: str, df: pd.DataFrame,
+                   price: float, atr: float, htf_direction: int) -> bool:
+        """
+        Evaluate a potential entry for `symbol` given current candle data.
+        Called from both tick() (4h) and scan_entries() (15 min).
+        Returns True if a position was opened.
+        """
+        signal, buy_p, sell_p = self.strategy.predict(df)
+        signal, buy_p, sell_p = self.strategy.apply_confluence(
+            signal, buy_p, sell_p, htf_direction
+        )
+
+        confidence = buy_p if signal == BUY else sell_p if signal == SELL else max(buy_p, sell_p)
+
+        if signal == HOLD:
+            self.log.info("  %s  → HOLD  (buy_p=%.2f  sell_p=%.2f  htf=%+d)",
+                          symbol, buy_p, sell_p, htf_direction)
+            return False
+
+        side = "long" if signal == BUY else "short"
+        sl   = self.risk.stop_loss_price(price, atr, side)
+        tp   = self.risk.take_profit_price(price, atr, side)
+        tp1  = self.risk.tp1_price_for(price, atr, side)
+        rr_ok, actual_rr = self.risk.rr_acceptable(price, sl, tp, side)
+
+        ev, win_rate, avg_rr = self.strategy.stats.ev_and_winrate(symbol)
+        ev_ok, ev_reason     = self.strategy.trade_is_worth_it(symbol)
+
+        qty, leverage = self.risk.calc_position(price, atr, win_rate)
+
+        verdict = rr_ok and ev_ok and signal != HOLD
+        print_trade_card(
+            pair=symbol, signal=signal, confidence=confidence,
+            ev=ev, win_rate=win_rate, avg_rr=avg_rr,
+            actual_rr=actual_rr, qty=qty,
+            risk_amount=self.risk.risk_per_trade_abs,
+            ev_reason=ev_reason, verdict=verdict,
+            htf_label=self.htf_label, htf_direction=htf_direction,
+        )
+
+        if not rr_ok:
+            self.log.info("  ⛔ %s  R/R %.2f < min %.2f — skipped", symbol, actual_rr, self.risk.min_rr)
+            return False
+        if not ev_ok:
+            self.log.info("  ⛔ %s  EV gate — %s", symbol, ev_reason)
+            return False
+
+        can_open, reason = self.risk.can_open(symbol)
+        if not can_open:
+            self.log.info("  ⛔ %s  %s", symbol, reason)
+            return False
+        if qty <= 0:
+            self.log.warning("  ⚠️  %s  Position size is 0 — check ATR/equity", symbol)
+            return False
+
+        if signal == BUY:
+            order_id = self._buy(symbol, qty, price)
+            if order_id:
+                pos = Position(
+                    pair=symbol, side="long",
+                    entry_price=price, quantity=qty,
+                    stop_loss=sl, take_profit=tp,
+                    tp1_price=tp1, quantity_original=qty,
+                    leverage=leverage,
+                    entry_time=utcnow().isoformat(),
+                    order_id=order_id,
+                )
+                self.risk.open_position(pos)
+                return True
+
+        elif signal == SELL and symbol in self.risk.open_positions:
+            pos = self.risk.open_positions[symbol]
+            self._sell(symbol, pos.quantity, price)
+            trade = self.risk.close_position(symbol, price)
+            if trade:
+                self.logger.log_trade(trade, self.risk.equity, "signal_exit")
+                self.strategy.record_outcome(
+                    trade, df, symbol=symbol,
+                    timeframe_label=TF_LABELS.get(self.tf, "4h"),
+                )
+
+        return False
+
+    # ── Exit monitor (runs every 5 min regardless of signal TF) ──────────────
+
+    def monitor_exits(self):
+        """
+        Runs every 5 min. Handles three exit scenarios for open positions:
+
+        1. Stop-loss / final TP  → full close (same as before)
+        2. TP1 hit               → partial close (50%), move SL to breakeven
+        3. LTF reversal (1h)     → full close of remaining qty if TP1 already hit
+           (momentum fading signal — lets winners run further than a fixed TP)
+        """
+        if not self.risk.open_positions:
+            return
+
+        for pair_cfg in self.pairs:
+            symbol = pair_cfg["symbol"]
+            pos    = self.risk.open_positions.get(symbol)
+            if not pos:
+                continue
+
+            # Quick candle fetch for current price
+            df = self.fetch_candles(symbol, limit=10)
+            if df is None or df.empty:
+                continue
+            price = self.live_price(symbol, df)
+
+            exit_reason = self.risk.should_exit(symbol, price)
+
+            # ── TP1: partial close — position stays open ───────────────────
+            if exit_reason == "tp1":
+                self._sell(symbol,
+                           round(pos.quantity_original * self.risk.tp1_close_pct, 6),
+                           price)
+                trade = self.risk.partial_close(symbol, price)
+                if trade:
+                    self.logger.log_trade(trade, self.risk.equity, "tp1_partial")
+                # Don't continue — position still open, check LTF next cycle
+                continue
+
+            # ── SL or final TP: full close ─────────────────────────────────
+            if exit_reason in ("stop_loss", "take_profit"):
+                self.log.info("🚨 %s  %s  @ £%.4f", exit_reason.upper(), symbol, price)
+                self._sell(symbol, pos.quantity, price)
+                trade = self.risk.close_position(symbol, price)
+                if trade:
+                    self.logger.log_trade(trade, self.risk.equity, exit_reason)
+                    full_df = self.fetch_candles(symbol)
+                    if full_df is not None:
+                        self.strategy.record_outcome(
+                            trade, full_df, symbol=symbol,
+                            timeframe_label=TF_LABELS.get(self.tf, "4h"),
+                        )
+                continue
+
+            # ── LTF reversal exit (only after TP1 has been hit) ───────────
+            if pos.tp1_hit:
+                ltf_df = self.fetch_candles(symbol, tf=self.ltf_tf, limit=50)
+                if self._ltf_reversal(ltf_df, pos.side):
+                    self.log.info("📉 LTF reversal exit  %s  @ £%.4f  (1h %s signal)",
+                                  symbol, price, self.ltf_label)
+                    self._sell(symbol, pos.quantity, price)
+                    trade = self.risk.close_position(symbol, price)
+                    if trade:
+                        self.logger.log_trade(trade, self.risk.equity, "ltf_reversal")
+                        full_df = self.fetch_candles(symbol)
+                        if full_df is not None:
+                            self.strategy.record_outcome(
+                                trade, full_df, symbol=symbol,
+                                timeframe_label=TF_LABELS.get(self.tf, "4h"),
+                            )
+
+    # ── 15-min entry scan (runs when flat — no open positions) ───────────────
+
+    def scan_entries(self):
+        """
+        Lightweight entry scan that runs every entry_scan_interval_s (15 min)
+        when the bot has no open positions.
+
+        Fetches the latest candles and evaluates the ML signal + confluence
+        filter for each pair. If a signal passes all gates, opens the trade.
+        No retraining or performance summaries — just entry hunting.
+        """
+        if self.risk.open_positions:
+            return   # already in a trade; monitor_exits handles everything
+
+        if self.risk.trading_halted():
+            return
+
+        self.log.debug("🔍 Entry scan @ %s", utcnow().strftime("%H:%M UTC"))
+
+        for pair_cfg in self.pairs:
+            symbol = pair_cfg["symbol"]
+            if symbol in self.risk.open_positions:
+                continue
+
+            df = self.fetch_candles(symbol)
+            if df is None or len(df) < 60:
+                continue
+
+            price = self.live_price(symbol, df)
+            atr   = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else price * 0.01
+
+            htf_df = None
+            if self.htf_tf != self.tf:
+                htf_df = self.fetch_candles(symbol, tf=self.htf_tf, limit=100)
+            htf_direction = self.strategy.htf_trend(htf_df) if htf_df is not None else 0
+
+            entered = self._try_enter(symbol, df, price, atr, htf_direction)
+            if entered:
+                self.log.info("✅ Entry scan opened trade on %s", symbol)
+
     # ── Main tick ─────────────────────────────────────────────────────────────
 
     def tick(self):
@@ -380,103 +622,13 @@ class TradingBot:
                 htf_df = self.fetch_candles(symbol, tf=self.htf_tf, limit=100)
             htf_direction = self.strategy.htf_trend(htf_df) if htf_df is not None else 0
 
-            # ── 3. Check open positions (SL / TP) ────────────────────────────
-            exit_reason = self.risk.should_exit(symbol, price)
-            if exit_reason:
-                pos = self.risk.open_positions.get(symbol)
-                if pos:
-                    self._sell(symbol, pos.quantity, price)
-                    trade = self.risk.close_position(symbol, price)
-                    if trade:
-                        self.logger.log_trade(trade, self.risk.equity, exit_reason)
-                        self.strategy.record_outcome(
-                            trade, df,
-                            symbol=symbol,
-                            timeframe_label=TF_LABELS.get(self.tf, "15m"),
-                        )
+            # ── 3. Skip entry evaluation if already in this position ─────────
+            # (monitor_exits handles all exit logic on its 5-min cycle)
+            if symbol in self.risk.open_positions:
                 continue
 
-            # ── 4. Get model signal ───────────────────────────────────────────
-            signal, buy_p, sell_p = self.strategy.predict(df)
-
-            # ── 5. Apply HTF confluence filter ────────────────────────────────
-            signal, buy_p, sell_p = self.strategy.apply_confluence(
-                signal, buy_p, sell_p, htf_direction
-            )
-
-            confidence = buy_p if signal == BUY else sell_p if signal == SELL else max(buy_p, sell_p)
-
-            if signal == HOLD:
-                self.log.info("  %s  → HOLD  (buy_p=%.2f  sell_p=%.2f  htf=%+d)",
-                              symbol, buy_p, sell_p, htf_direction)
-                continue
-
-            # ── 6. Calculate R/R and position size ───────────────────────────
-            side = "long" if signal == BUY else "short"
-            sl   = self.risk.stop_loss_price(price, atr, side)
-            tp   = self.risk.take_profit_price(price, atr, side)
-            rr_ok, actual_rr = self.risk.rr_acceptable(price, sl, tp, side)
-
-            ev, win_rate, avg_rr = self.strategy.stats.ev_and_winrate(symbol)
-            ev_ok, ev_reason     = self.strategy.trade_is_worth_it(symbol)
-
-            qty, leverage = self.risk.calc_position(price, atr, win_rate)
-
-            # ── 7. Print trade quality card ───────────────────────────────────
-            verdict = rr_ok and ev_ok and signal != HOLD
-            print_trade_card(
-                pair=symbol, signal=signal, confidence=confidence,
-                ev=ev, win_rate=win_rate, avg_rr=avg_rr,
-                actual_rr=actual_rr, qty=qty,
-                risk_amount=self.risk.risk_per_trade_abs,
-                ev_reason=ev_reason, verdict=verdict,
-                htf_label=self.htf_label, htf_direction=htf_direction,
-            )
-
-            # ── 8. Gate checks ────────────────────────────────────────────────
-            if not rr_ok:
-                self.log.info("  ⛔ %s  R/R %.2f < min %.2f — skipped",
-                              symbol, actual_rr, self.risk.min_rr)
-                continue
-
-            if not ev_ok:
-                self.log.info("  ⛔ %s  EV gate — %s", symbol, ev_reason)
-                continue
-
-            can_open, reason = self.risk.can_open(symbol)
-            if not can_open:
-                self.log.info("  ⛔ %s  %s", symbol, reason)
-                continue
-
-            if qty <= 0:
-                self.log.warning("  ⚠️  %s  Position size is 0 — check ATR/equity", symbol)
-                continue
-
-            # ── 9. Open the position ──────────────────────────────────────────
-            if signal == BUY:
-                order_id = self._buy(symbol, qty, price)
-                if order_id:
-                    pos = Position(
-                        pair=symbol, side="long",
-                        entry_price=price, quantity=qty,
-                        stop_loss=sl, take_profit=tp,
-                        leverage=leverage,
-                        entry_time=utcnow().isoformat(),
-                        order_id=order_id,
-                    )
-                    self.risk.open_position(pos)
-
-            elif signal == SELL and symbol in self.risk.open_positions:
-                pos = self.risk.open_positions[symbol]
-                self._sell(symbol, pos.quantity, price)
-                trade = self.risk.close_position(symbol, price)
-                if trade:
-                    self.logger.log_trade(trade, self.risk.equity, "signal_exit")
-                    self.strategy.record_outcome(
-                        trade, df,
-                        symbol=symbol,
-                        timeframe_label=TF_LABELS.get(self.tf, "15m"),
-                    )
+            # ── 4–9. Evaluate entry signal and open position if warranted ─────
+            self._try_enter(symbol, df, price, atr, htf_direction)
 
         # Performance summary every 5 ticks
         if self._tick_count % 5 == 0:
@@ -503,24 +655,49 @@ class TradingBot:
 
         self.startup()
 
-        # Read interval AFTER startup so any analysis-driven TF switch takes effect
+        # Three-speed loop:
+        #   Every 5 min  → monitor_exits()   — SL/TP/TP1/LTF reversal check
+        #   Every 15 min → scan_entries()    — ML entry hunt when flat
+        #   Every 4 h    → tick()            — full tick: retrain, summaries, entries
+        tc = self.cfg["trading"]
+        MONITOR_INTERVAL = tc.get("monitor_interval_s",    300)    # 5 min
+        SCAN_INTERVAL    = tc.get("entry_scan_interval_s", 900)    # 15 min
+        SIGNAL_INTERVAL  = tc["loop_interval_s"]                   # 4 h
+
+        last_scan_time   = 0.0   # force an entry scan almost immediately
+        last_signal_time = 0.0   # force a full tick on startup
+
         while True:
             try:
-                self.tick()
+                now = time.time()
+
+                # 1. Always check SL / TP / TP1 / LTF reversal
+                self.monitor_exits()
+
+                # 2. Full 4h tick — retraining, performance summary, entries
+                if now - last_signal_time >= SIGNAL_INTERVAL:
+                    self.tick()
+                    last_signal_time = time.time()
+                    last_scan_time   = time.time()   # reset so scan doesn't fire immediately after
+
+                # 3. 15-min entry scan — only runs when no position is open
+                elif now - last_scan_time >= SCAN_INTERVAL:
+                    self.scan_entries()
+                    last_scan_time = time.time()
+
             except KeyboardInterrupt:
                 self.log.info("Shutdown requested by user.")
                 self.logger.print_summary()
                 break
             except Exception as exc:
-                self.log.exception("Unexpected error in tick: %s", exc)
+                self.log.exception("Unexpected error in main loop: %s", exc)
 
-            interval = self.cfg["trading"]["loop_interval_s"]
-            self.log.info("💤 Next tick in %ds…", interval)
-            time.sleep(interval)
+            time.sleep(MONITOR_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
