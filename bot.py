@@ -137,14 +137,13 @@ class TradingBot:
         self.pairs    = [p for p in self.cfg["trading"]["pairs"] if p["enabled"]]
         self.tf       = str(self.cfg["trading"]["timeframe"])
         self.lookback = self.cfg["trading"]["lookback_candles"]
-        self.leverage = self.cfg["trading"].get("leverage", 1)
 
         mode = "🟡 PAPER" if self.paper else "🔴 LIVE"
-        self.log.info("%s MODE  |  Account: £%.2f  |  Risk/trade: £%.2f  |  Lev: %dx",
+        self.log.info("%s MODE  |  Account: £%.2f  |  Risk/trade: £%.2f  |  Lev: dynamic (max %dx)",
                       mode,
                       self.cfg["risk"]["initial_capital"],
                       self.cfg["risk"]["risk_per_trade_abs"],
-                      self.leverage)
+                      self.cfg["risk"].get("max_leverage", 20))
 
         self.client   = WeexClient(
             api_key=ec["api_key"], api_secret=ec["api_secret"],
@@ -267,8 +266,8 @@ class TradingBot:
             ev, win_rate, avg_rr = self.strategy.stats.ev_and_winrate(symbol)
             ev_ok, ev_reason     = self.strategy.trade_is_worth_it(symbol)
 
-            # Kelly-informed position size
-            qty = self.risk.position_size(price, atr, self.leverage, win_rate)
+            # Dynamic position size + auto-leverage based on stop distance
+            qty, leverage = self.risk.calc_position(price, atr, win_rate)
 
             # ── 5. Print trade quality card ───────────────────────────────────
             verdict = rr_ok and ev_ok and signal != HOLD
@@ -307,7 +306,7 @@ class TradingBot:
                         pair=symbol, side="long",
                         entry_price=price, quantity=qty,
                         stop_loss=sl, take_profit=tp,
-                        leverage=self.leverage,
+                        leverage=leverage,
                         entry_time=utcnow().isoformat(),
                         order_id=order_id,
                     )
@@ -338,7 +337,8 @@ class TradingBot:
         self.log.info("🚀 Weex Trading Bot  v2  starting…")
         self.log.info("   Pairs     : %s", [p["name"] for p in self.pairs])
         self.log.info("   Timeframe : %s min", self.tf)
-        self.log.info("   Leverage  : %dx", self.leverage)
+        self.log.info("   Leverage  : dynamic — auto-set per trade (max %dx)",
+                      self.cfg["risk"].get("max_leverage", 20))
         self.log.info("   Account   : £%.2f  |  Risk/trade: £%.2f",
                       self.cfg["risk"]["initial_capital"],
                       self.cfg["risk"]["risk_per_trade_abs"])

@@ -11,7 +11,6 @@ exchange:
 # ── Set paper_trading: true while testing. Change to false for live. ──
 trading:
   paper_trading: true
-  leverage: 5          # Leverage multiplier (1 = no leverage). Start low while learning.
 
   pairs:
     - symbol:     "BTCUSDT_SPBL"
@@ -45,6 +44,7 @@ risk:
   min_rr_ratio:         1.5      # Reject any trade where actual R/R falls below 1.5
   max_open_positions:   2        # Only 2 concurrent positions (£100 account protection)
   max_daily_loss_abs:   10.0     # Auto-halt if we lose £10 in a single day
+  max_leverage:         20       # Hard cap — leverage will never exceed this
 
 strategy:
   # ── Signal thresholds ──────────────────────────────────────────────────────

@@ -97,6 +97,9 @@ class WeexClient:
             resp = self.session.get(self.base_url + path + qs, headers=headers, timeout=10)
             resp.raise_for_status()
             data = resp.json()
+            # Some Weex endpoints (e.g. klines) return a raw list, not {"data": [...]}
+            if isinstance(data, list):
+                return {"data": data, "code": "0"}
             if data.get("code") not in (None, "0", 0, "00000"):
                 logger.warning("API warning [GET %s]: %s", path, data)
             return data
@@ -143,8 +146,23 @@ class WeexClient:
         if not raw:
             logger.debug("Empty candle response for %s: %s", symbol, data)
             return []
+
+        # Normalise: if candles are dicts, convert to [ts, o, h, l, c, v] lists
+        if isinstance(raw[0], dict):
+            raw = [
+                [
+                    c.get("t") or c.get("time") or c.get("openTime"),
+                    c.get("o") or c.get("open"),
+                    c.get("h") or c.get("high"),
+                    c.get("l") or c.get("low"),
+                    c.get("c") or c.get("close"),
+                    c.get("v") or c.get("volume"),
+                ]
+                for c in raw
+            ]
+
         # Weex returns newest-first — reverse to chronological order
-        return list(reversed(raw)) if raw else []
+        return list(reversed(raw))
 
     # ── Private account / trading endpoints ───────────────────────────────────
 
