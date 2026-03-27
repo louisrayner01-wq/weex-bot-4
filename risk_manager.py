@@ -22,16 +22,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Position:
-    pair:          str
-    side:          str        # 'long' | 'short'
-    entry_price:   float
-    quantity:      float
-    stop_loss:     float
-    take_profit:   float
-    leverage:      int
-    entry_time:    str
-    candles_held:  int = 0
-    order_id:      Optional[str] = None
+    pair:               str
+    side:               str        # 'long' | 'short'
+    entry_price:        float
+    quantity:           float      # current remaining quantity (reduced after TP1)
+    stop_loss:          float
+    take_profit:        float
+    leverage:           int
+    entry_time:         str
+    candles_held:       int   = 0
+    order_id:           Optional[str] = None
+    # ── Multi-TP fields ──────────────────────────────────────────────────────
+    tp1_price:          float = 0.0    # TP1 price level (set on open)
+    tp1_hit:            bool  = False  # True once 50% has been closed at TP1
+    quantity_original:  float = 0.0   # Full qty at entry (before any partial close)
 
     @property
     def rr_ratio(self) -> float:
@@ -54,6 +58,8 @@ class RiskManager:
         self.risk_per_trade_abs = rc["risk_per_trade_abs"]   # £5
         self.sl_atr_mult        = rc["stop_loss_atr_mult"]   # 1.5
         self.tp_atr_mult        = rc["take_profit_atr_mult"] # 3.0
+        self.tp1_atr_mult       = rc.get("take_profit_1_atr_mult",  1.5)  # 1:1 R/R
+        self.tp1_close_pct      = rc.get("take_profit_1_close_pct", 0.50) # 50%
         self.min_rr             = rc["min_rr_ratio"]         # 1.5
         self.max_open           = rc["max_open_positions"]   # 2
         self.max_daily_loss     = rc["max_daily_loss_abs"]   # £10
@@ -95,6 +101,62 @@ class RiskManager:
     def take_profit_price(self, entry: float, atr: float, side: str) -> float:
         dist = atr * self.tp_atr_mult
         return entry + dist if side == "long" else entry - dist
+
+    def tp1_price_for(self, entry: float, atr: float, side: str) -> float:
+        """First partial take-profit at tp1_atr_mult × ATR (default 1:1 R/R)."""
+        dist = atr * self.tp1_atr_mult
+        return entry + dist if side == "long" else entry - dist
+
+    # ── Partial close at TP1 ─────────────────────────────────────────────────
+
+    def partial_close(self, pair: str, exit_price: float) -> Optional[dict]:
+        """
+        Close tp1_close_pct (50%) of an open position at TP1.
+        Moves stop loss to entry price (breakeven) so the remaining half
+        is now a risk-free runner.
+        Returns a trade-record dict for logging, or None if not applicable.
+        """
+        pos = self.open_positions.get(pair)
+        if not pos or pos.tp1_hit:
+            return None
+
+        close_qty = round(pos.quantity_original * self.tp1_close_pct, 6)
+        remaining = round(pos.quantity - close_qty, 6)
+
+        if pos.side == "long":
+            price_move = exit_price - pos.entry_price
+        else:
+            price_move = pos.entry_price - exit_price
+
+        pnl_usdt = close_qty * price_move * pos.leverage
+        pnl_pct  = price_move / pos.entry_price * pos.leverage
+
+        self.equity = max(self.equity + pnl_usdt, 0.0)
+
+        # Update position in place — reduce qty, move SL to breakeven, flag TP1 done
+        pos.quantity  = max(remaining, 0.0)
+        pos.stop_loss = pos.entry_price    # breakeven
+        pos.tp1_hit   = True
+
+        logger.info(
+            "🎯 TP1  %s  closed %.0f%%  qty=%.5f @ £%.4f | "
+            "PnL=%+.2f£ | Remaining=%.5f | SL→breakeven £%.4f",
+            pair, self.tp1_close_pct * 100, close_qty, exit_price,
+            pnl_usdt, remaining, pos.entry_price,
+        )
+
+        return {
+            "pair":         pair,
+            "side":         pos.side,
+            "entry_price":  pos.entry_price,
+            "exit_price":   exit_price,
+            "quantity":     close_qty,
+            "leverage":     pos.leverage,
+            "pnl_pct":      pnl_pct,
+            "pnl_usdt":     pnl_usdt,
+            "candles_held": pos.candles_held,
+            "exit_type":    "tp1_partial",
+        }
 
     # ── R/R validation ────────────────────────────────────────────────────────
 
@@ -184,11 +246,19 @@ class RiskManager:
         if pos.candles_held < self.min_holding:
             return None
         if pos.side == "long":
-            if current_price <= pos.stop_loss:   return "stop_loss"
-            if current_price >= pos.take_profit: return "take_profit"
+            if current_price <= pos.stop_loss:
+                return "stop_loss"
+            if not pos.tp1_hit and pos.tp1_price > 0 and current_price >= pos.tp1_price:
+                return "tp1"                    # partial close — trade stays open
+            if current_price >= pos.take_profit:
+                return "take_profit"
         else:
-            if current_price >= pos.stop_loss:   return "stop_loss"
-            if current_price <= pos.take_profit: return "take_profit"
+            if current_price >= pos.stop_loss:
+                return "stop_loss"
+            if not pos.tp1_hit and pos.tp1_price > 0 and current_price <= pos.tp1_price:
+                return "tp1"
+            if current_price <= pos.take_profit:
+                return "take_profit"
         return None
 
     # ── Position registry ─────────────────────────────────────────────────────
@@ -235,3 +305,4 @@ class RiskManager:
             "pnl_usdt":     pnl_usdt,
             "candles_held": pos.candles_held,
         }
+
