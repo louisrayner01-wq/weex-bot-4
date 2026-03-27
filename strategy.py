@@ -25,6 +25,7 @@ Architecture
 """
 
 import os
+import json
 import logging
 import numpy as np
 import pandas as pd
@@ -176,6 +177,7 @@ class TradingStrategy:
         self.min_win_rate    = sc["min_win_rate"]
         self.min_ev_trades   = sc["min_ev_trades"]
         self.models_dir      = cfg["logging"]["models_dir"]
+        self.data_dir        = cfg.get("data", {}).get("data_dir", "/data")
 
         os.makedirs(self.models_dir, exist_ok=True)
 
@@ -187,6 +189,10 @@ class TradingStrategy:
         self.trades_since_retrain = 0
         self.stats = TradeStats(min_trades=self.min_ev_trades)
         self.feature_importance: Dict[str, float] = {}
+
+        # Analysis recommendations (loaded from /data/analysis_results.json)
+        self.analysis: Optional[Dict] = None
+        self._load_analysis_results()
 
         self._try_load_model()
 
@@ -218,6 +224,144 @@ class TradingStrategy:
         }, self._meta_path())
         logger.info("💾 Model saved (%d total trades)", self.total_trades)
 
+    # ── Analysis integration ──────────────────────────────────────────────────
+
+    def _load_analysis_results(self) -> None:
+        """Load the latest analysis results produced by analysis.py."""
+        path = os.path.join(self.data_dir, "analysis_results.json")
+        if not os.path.exists(path):
+            logger.info("No analysis results yet — running with defaults.")
+            return
+        try:
+            with open(path) as f:
+                self.analysis = json.load(f)
+            recs = self.analysis.get("recommendations", {})
+            tf   = recs.get("best_signal_timeframe", "unknown")
+            filt = recs.get("best_filter_timeframe", "none")
+            top  = recs.get("top_features", [])[:5]
+            logger.info("📊 Analysis loaded | best_tf=%s | filter=%s | top_features=%s",
+                        tf, filt, top)
+        except Exception as exc:
+            logger.warning("Could not load analysis results: %s", exc)
+
+    def reload_analysis(self) -> None:
+        """Reload analysis results (call after a fresh analysis run)."""
+        self._load_analysis_results()
+
+    def recommended_features(self) -> List[str]:
+        """
+        Return the top features recommended by analysis, or fall back to
+        the full FEATURE_COLS list if no analysis has been run.
+        """
+        if self.analysis:
+            top = self.analysis.get("recommendations", {}).get("top_features", [])
+            if top:
+                return [f for f in top if f in FEATURE_COLS]
+        return list(FEATURE_COLS)
+
+    # ── Higher-timeframe confluence ───────────────────────────────────────────
+
+    def htf_trend(self, higher_tf_df: pd.DataFrame) -> int:
+        """
+        Determine the trend direction from a higher-timeframe DataFrame.
+        Returns:  +1 (bullish)  |  -1 (bearish)  |  0 (neutral / mixed)
+
+        Logic:
+          • EMA21 position: is price above or below the 21-period EMA?
+          • MACD histogram: is momentum positive or negative?
+          Both must agree for a strong trend reading; mixed signals = neutral.
+        """
+        if higher_tf_df is None or len(higher_tf_df) < 30:
+            return 0
+
+        df = compute_features(higher_tf_df.copy())
+        last = df.iloc[-1]
+
+        ema_bull  = last.get("ema_21", np.nan)
+        macd_diff = last.get("macd_diff", np.nan)
+        close     = last.get("close", np.nan)
+
+        if pd.isna(ema_bull) or pd.isna(close):
+            return 0
+
+        price_above_ema = close > ema_bull
+        price_below_ema = close < ema_bull
+
+        if not pd.isna(macd_diff):
+            macd_bull = macd_diff > 0
+            macd_bear = macd_diff < 0
+            if price_above_ema and macd_bull:
+                return  1   # strong bullish confluence
+            if price_below_ema and macd_bear:
+                return -1   # strong bearish confluence
+            return 0        # EMA and MACD disagree → neutral
+        else:
+            # No MACD — use EMA alone
+            if price_above_ema:
+                return  1
+            if price_below_ema:
+                return -1
+            return 0
+
+    def apply_confluence(self,
+                         signal: int,
+                         buy_p: float,
+                         sell_p: float,
+                         htf_direction: int) -> Tuple[int, float, float]:
+        """
+        Adjust a primary signal using the higher-timeframe trend direction.
+
+        Rules:
+          • BUY  + bullish HTF  → confirmed, slight confidence boost
+          • BUY  + bearish HTF  → downgraded to HOLD (fighting the trend)
+          • BUY  + neutral HTF  → kept as-is (no penalty, no boost)
+          • SELL + bearish HTF  → confirmed
+          • SELL + bullish HTF  → downgraded to HOLD
+          • HOLD                → unchanged regardless of HTF
+        """
+        if signal == HOLD or htf_direction == 0:
+            return signal, buy_p, sell_p
+
+        if signal == BUY:
+            if htf_direction == 1:
+                # Confirmed — small boost to surface the trade card
+                return BUY, min(buy_p * 1.08, 0.99), sell_p
+            else:
+                # Contradicted — suppress
+                logger.debug("HTF bearish — suppressing BUY signal")
+                return HOLD, buy_p, sell_p
+
+        if signal == SELL:
+            if htf_direction == -1:
+                return SELL, buy_p, min(sell_p * 1.08, 0.99)
+            else:
+                logger.debug("HTF bullish — suppressing SELL signal")
+                return HOLD, buy_p, sell_p
+
+        return signal, buy_p, sell_p
+
+    # ── Historical data loader ────────────────────────────────────────────────
+
+    def load_historical_candles(self, symbol: str,
+                                 timeframe_label: str = "15m") -> Optional[pd.DataFrame]:
+        """
+        Load saved historical CSV for a symbol/timeframe from the data dir.
+        Returns None if not available.
+        """
+        # Strip _SPBL suffix for filename lookup
+        sym = symbol.replace("_SPBL", "").replace("_UMCBL", "")
+        path = os.path.join(self.data_dir, f"{sym}_{timeframe_label}.csv")
+        if not os.path.exists(path):
+            return None
+        try:
+            df = pd.read_csv(path, parse_dates=["timestamp"])
+            logger.info("📂 Loaded historical data: %s %s — %d candles",
+                        sym, timeframe_label, len(df))
+            return df
+        except Exception as exc:
+            logger.warning("Could not load historical CSV %s: %s", path, exc)
+            return None
+
     # ── Feature preparation ───────────────────────────────────────────────────
 
     def _prepare_X(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -228,7 +372,25 @@ class TradingStrategy:
 
     # ── Training ──────────────────────────────────────────────────────────────
 
-    def train(self, df: pd.DataFrame):
+    def train(self, df: pd.DataFrame, symbol: str = "", timeframe_label: str = "15m"):
+        """
+        Train the model. If historical CSV data is available for this symbol,
+        it is prepended to the live candle data to give a much richer dataset.
+        """
+        # ── Merge historical + live data ──────────────────────────────────────
+        if symbol:
+            hist = self.load_historical_candles(symbol, timeframe_label)
+            if hist is not None and len(hist) > 100:
+                # Combine: historical first, then live candles on top
+                combined = pd.concat([hist, df], ignore_index=True)
+                combined = (combined
+                            .drop_duplicates("timestamp")
+                            .sort_values("timestamp")
+                            .reset_index(drop=True))
+                logger.info("📚 Training on %d historical + %d live candles = %d total",
+                            len(hist), len(df), len(combined))
+                df = combined
+
         df = compute_features(df)
         labels = label_candles(df, self.label_horizon, self.label_threshold)
 
@@ -353,7 +515,8 @@ class TradingStrategy:
 
     # ── Outcome recording (triggers retraining) ───────────────────────────────
 
-    def record_outcome(self, outcome: dict, df: pd.DataFrame):
+    def record_outcome(self, outcome: dict, df: pd.DataFrame,
+                       symbol: str = "", timeframe_label: str = "15m"):
         """Call whenever a trade closes. Triggers retraining when due."""
         self.stats.record(outcome)
         self.total_trades        += 1
@@ -370,10 +533,11 @@ class TradingStrategy:
         freq = retrain_frequency(self.total_trades, self.retrain_stages)
         if self.trades_since_retrain >= freq:
             logger.info("🔄 Retraining triggered (every %d trades at this stage)…", freq)
-            self.train(df)
+            self.train(df, symbol=symbol, timeframe_label=timeframe_label)
 
     # ── Pair ranking for dynamic allocation ───────────────────────────────────
 
     def best_pairs(self) -> Dict[str, float]:
         return self.stats.rank_pairs()
+
 
