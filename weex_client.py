@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # ── Weex Spot API endpoints ────────────────────────────────────────────────────
 ENDPOINTS = {
-    "ticker":        "/api/v3/market/ticker",
+    "ticker":        "/api/v3/market/tickers",      # returns list; we filter by symbol
     "candles":       "/api/v3/market/klines",       # confirmed correct endpoint
     "depth":         "/api/v3/market/depth",
     "balance":       "/api/v2/account/assets",
@@ -104,7 +104,9 @@ class WeexClient:
                 logger.warning("API warning [GET %s]: %s", path, data)
             return data
         except Exception as exc:
-            logger.error("GET %s failed: %s", path, exc)
+            # Downgrade ticker 404s to warning — bot falls back to candle close price
+            level = logging.WARNING if "404" in str(exc) else logging.ERROR
+            logger.log(level, "GET %s failed: %s", path, exc)
             return {}
 
     def _post(self, path: str, payload: Dict, auth: bool = True) -> Dict:
@@ -125,9 +127,16 @@ class WeexClient:
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
         """Return current price data for a symbol."""
-        data = self._get(ENDPOINTS["ticker"],
-                         {"symbol": _market_symbol(symbol)}, auth=False)
-        return data.get("data")
+        sym = _market_symbol(symbol)
+        data = self._get(ENDPOINTS["ticker"], {"symbol": sym}, auth=False)
+        result = data.get("data")
+        # tickers endpoint may return a list — find our symbol
+        if isinstance(result, list):
+            for item in result:
+                if item.get("symbol") == sym:
+                    return item
+            return None
+        return result
 
     def get_candles(self, symbol: str, granularity: str = "60", limit: int = 300) -> List[List]:
         """
