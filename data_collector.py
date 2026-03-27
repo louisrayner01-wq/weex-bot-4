@@ -47,8 +47,6 @@ TF_LABELS = {
 
 SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-BATCH_SIZE    = 500          # candles per API request (Weex max)
-LOOKBACK_DAYS = 730          # 2 years of history
 REQUEST_DELAY = 0.4          # seconds between requests (rate-limit safety)
 REFRESH_HOURS = 12           # re-fetch if CSV is older than this
 
@@ -102,7 +100,7 @@ class DataCollector:
                 return pd.read_csv(filepath, parse_dates=["timestamp"])
 
         # ── Fetch ─────────────────────────────────────────────────────────────
-        logger.info("  FETCH   %s %s  (target: %d days) …", symbol, label, LOOKBACK_DAYS)
+        logger.info("  FETCH   %s %s  (max available candles) …", symbol, label)
         raw = self._fetch_history(symbol, timeframe_min)
 
         if not raw:
@@ -130,49 +128,32 @@ class DataCollector:
 
     def _fetch_history(self, symbol: str, timeframe_min: str) -> List[List]:
         """
-        Paginate backwards through Weex klines to collect LOOKBACK_DAYS of data.
-        Returns a flat list of candle rows in chronological order.
-        """
-        now_ms         = int(time.time() * 1000)
-        target_start   = now_ms - int(LOOKBACK_DAYS * 24 * 3600 * 1000)
-        current_end_ms = now_ms
-        all_candles    = []
-        batch_num      = 0
+        Fetch the maximum available candle history from Weex in a single request.
 
-        # Use symbol without _SPBL suffix for market data
+        Weex's klines endpoint does not support endTime/startTime pagination —
+        passing those parameters returns a 400 error.  Instead we request the
+        largest batch the API will accept, trying progressively smaller limits
+        until one succeeds.  This gives us the most recent N candles available.
+
+        Returns a list of candle rows in chronological order.
+        """
         api_symbol = symbol.replace("_SPBL", "")
 
-        while current_end_ms > target_start:
+        # Try largest limits first — stop at the first successful response
+        for limit in [1000, 500, 300]:
             batch = self.client.get_candles(
                 symbol      = api_symbol,
                 granularity = timeframe_min,
-                limit       = BATCH_SIZE,
-                end_time    = current_end_ms,
+                limit       = limit,
+                # No end_time — Weex rejects it with 400
             )
-
-            if not batch:
-                logger.debug("Empty batch — stopping pagination for %s %s", symbol, timeframe_min)
-                break
-
-            # batch is chronological (oldest first) after reversal in WeexClient
-            all_candles = batch + all_candles   # prepend older data
-            batch_num  += 1
-
-            oldest_ts = int(float(batch[0][0]))   # first row = oldest candle
-
-            if batch_num % 20 == 0:
-                logger.info("    … batch %d  |  %d candles so far  |  oldest: %s",
-                            batch_num, len(all_candles),
-                            pd.Timestamp(oldest_ts, unit="ms").strftime("%Y-%m-%d"))
-
-            if oldest_ts <= target_start:
-                break
-
-            # Step back to just before the oldest candle we have
-            current_end_ms = oldest_ts - 1
+            if batch:
+                logger.info("    … fetched %d candles for %s %s (limit=%d)",
+                            len(batch), symbol, timeframe_min, limit)
+                return batch
             time.sleep(REQUEST_DELAY)
 
-        return all_candles
+        return []
 
     def _to_dataframe(self, raw: List[List]) -> pd.DataFrame:
         """Convert raw candle list to a clean, deduped, sorted DataFrame."""
