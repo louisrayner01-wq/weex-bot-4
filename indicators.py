@@ -16,12 +16,15 @@ logger = logging.getLogger(__name__)
 def candles_to_df(raw_candles: List[List]) -> pd.DataFrame:
     """
     Convert raw Weex candle list to a clean DataFrame.
-    Weex returns: [timestamp_ms, open, high, low, close, volume]
+    Weex returns 11 fields per candle — we only need the first 6:
+    [timestamp_ms, open, high, low, close, volume, ...]
     """
     if not raw_candles:
         return pd.DataFrame()
 
-    df = pd.DataFrame(raw_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    # Trim to first 6 fields — Weex sends extra fields we don't need
+    trimmed = [row[:6] for row in raw_candles]
+    df = pd.DataFrame(trimmed, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"].astype(float), unit="ms")
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
