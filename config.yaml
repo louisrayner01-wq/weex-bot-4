@@ -30,7 +30,7 @@ trading:
 
   timeframe:        "60"      # Candle granularity in minutes (15 / 60 / 240 / 1440)
   lookback_candles: 300       # Candles fetched for indicator calculation
-  loop_interval_s:  3600      # Run every N seconds (3600 = 1 hour, matches timeframe)
+  loop_interval_s:  900      # Run every N seconds (3600 = 1 hour, matches timeframe)
 
 risk:
   # Paper account = £100 equivalent in USDT
