@@ -147,18 +147,28 @@ class WeexClient:
             return result
         return None
 
-    def get_candles(self, symbol: str, granularity: str = "60", limit: int = 300) -> List[List]:
+    def get_candles(self, symbol: str, granularity: str = "60", limit: int = 300,
+                    start_time: Optional[int] = None,
+                    end_time: Optional[int] = None) -> List[List]:
         """
         Fetch OHLCV candles from Weex.
         granularity: minutes as string from config ("60" = 1 hour)
-        Returns list of [timestamp_ms, open, high, low, close, volume] in chronological order.
+        start_time / end_time: optional Unix timestamps in milliseconds for
+            paginating through historical data.
+        Returns list of [timestamp_ms, open, high, low, close, volume] in
+            chronological order.
         """
         interval = INTERVAL_MAP.get(str(granularity), "1h")
-        params = {
+        params: Dict[str, Any] = {
             "symbol":   _market_symbol(symbol),
             "interval": interval,
             "limit":    limit,
         }
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+
         data = self._get(ENDPOINTS["candles"], params, auth=False)
         raw = data.get("data", [])
         if not raw:
