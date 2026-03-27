@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 # ── Weex Spot API endpoints ────────────────────────────────────────────────────
 ENDPOINTS = {
-    "ticker":        "/api/v3/market/tickers",      # returns list; we filter by symbol
+    "ticker":        "/api/v3/market/ticker",       # GET ?symbol=BTCUSDT
+    "ticker_v2":     "/api/v2/spot/market/tickers", # fallback v2 endpoint
     "candles":       "/api/v3/market/klines",       # confirmed correct endpoint
     "depth":         "/api/v3/market/depth",
     "balance":       "/api/v2/account/assets",
@@ -104,8 +105,9 @@ class WeexClient:
                 logger.warning("API warning [GET %s]: %s", path, data)
             return data
         except Exception as exc:
-            # Downgrade ticker 404s to warning — bot falls back to candle close price
-            level = logging.WARNING if "404" in str(exc) else logging.ERROR
+            # 404s are logged at DEBUG — callers (e.g. get_ticker) handle missing
+            # data gracefully so there is no need to pollute INFO/WARNING logs.
+            level = logging.DEBUG if "404" in str(exc) else logging.ERROR
             logger.log(level, "GET %s failed: %s", path, exc)
             return {}
 
@@ -126,17 +128,24 @@ class WeexClient:
     # ── Public market data (no auth needed) ───────────────────────────────────
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
-        """Return current price data for a symbol."""
+        """Return current price data for a symbol.
+        Tries v3 ticker then v2 spot ticker; returns None quietly if both fail
+        so callers can fall back to candle close price without noisy log spam.
+        """
         sym = _market_symbol(symbol)
-        data = self._get(ENDPOINTS["ticker"], {"symbol": sym}, auth=False)
-        result = data.get("data")
-        # tickers endpoint may return a list — find our symbol
-        if isinstance(result, list):
-            for item in result:
-                if item.get("symbol") == sym:
-                    return item
-            return None
-        return result
+        for endpoint in (ENDPOINTS["ticker"], ENDPOINTS["ticker_v2"]):
+            data = self._get(endpoint, {"symbol": sym}, auth=False)
+            result = data.get("data")
+            if not result:
+                continue
+            # Some endpoints return a list — find our symbol
+            if isinstance(result, list):
+                for item in result:
+                    if item.get("symbol") == sym:
+                        return item
+                continue
+            return result
+        return None
 
     def get_candles(self, symbol: str, granularity: str = "60", limit: int = 300) -> List[List]:
         """
@@ -225,3 +234,4 @@ class WeexClient:
         """Quick connectivity check using public ticker endpoint."""
         result = self.get_ticker("BTCUSDT")
         return result is not None
+
