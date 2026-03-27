@@ -279,18 +279,41 @@ class TradingBot:
     def _apply_analysis_recommendations(self):
         """
         Read analysis results and update bot settings accordingly:
-          • Use the recommended signal timeframe
-          • Use the recommended higher-TF filter
+          • Switch the signal timeframe to the best one found by analysis
+          • Use the recommended higher-TF filter (or auto-pick the next TF up)
+          • Update the loop interval to match the new signal TF
         """
         if not self.strategy.analysis:
             return
         recs = self.strategy.analysis.get("recommendations", {})
+        rev_map = {v: k for k, v in TF_LABELS.items()}
 
-        # Update HTF confluence timeframe
+        # ── Auto-select HTF based on signal TF (next timeframe up) ────────────
+        HTF_UP       = {"5": "60", "15": "60", "60": "240", "240": "1440", "1440": "1440"}
+        TF_INTERVALS = {"5": 300, "15": 900, "60": 3600, "240": 14400, "1440": 86400}
+
+        # ── Switch signal timeframe if analysis found a better one ─────────────
+        best_signal = recs.get("best_signal_timeframe")  # e.g. "4h"
+        if best_signal:
+            sig_min = rev_map.get(best_signal)
+            if sig_min and sig_min != self.tf:
+                old_tf   = self.tf
+                self.tf  = sig_min
+                # Update loop interval so the run() loop uses the right cadence
+                self.cfg["trading"]["loop_interval_s"] = TF_INTERVALS.get(sig_min,
+                                                         self.cfg["trading"]["loop_interval_s"])
+                # Auto-set HTF to one step up from new signal TF
+                htf_min        = HTF_UP.get(sig_min, "1440")
+                self.htf_tf    = htf_min
+                self.htf_label = TF_LABELS.get(htf_min, "1d")
+                self.log.info("📊 Analysis switched signal TF: %s → %s  (HTF=%s  loop=%ds)",
+                              TF_LABELS.get(old_tf, old_tf), best_signal,
+                              self.htf_label,
+                              self.cfg["trading"]["loop_interval_s"])
+
+        # ── Override HTF if analysis explicitly recommends a filter ───────────
         best_filter = recs.get("best_filter_timeframe")  # e.g. "1h"
-        if best_filter:
-            # Map label back to minutes key
-            rev_map = {v: k for k, v in TF_LABELS.items()}
+        if best_filter and best_filter != "None":
             htf_min = rev_map.get(best_filter)
             if htf_min:
                 self.htf_tf    = htf_min
@@ -305,21 +328,24 @@ class TradingBot:
     def _initial_train(self):
         """
         Train the model on the full historical dataset for the primary pair.
+        Uses the SIGNAL timeframe CSV (not the HTF CSV) so the model learns
+        the same candle patterns it will predict on during ticking.
         Falls back to live candles if no CSV exists.
         """
-        primary = self.pairs[0]["symbol"]
-        self.log.info("⏳ Training model on historical data for %s…", primary)
+        primary   = self.pairs[0]["symbol"]
+        sig_label = TF_LABELS.get(self.tf, "4h")   # e.g. "240" → "4h"
+        self.log.info("⏳ Training model on historical data for %s [%s]…", primary, sig_label)
 
-        # Try loading historical CSV first (this feeds the train() call inside strategy)
-        hist = self.strategy.load_historical_candles(primary, self.htf_label)
+        # Try loading the signal-TF historical CSV first
+        hist = self.strategy.load_historical_candles(primary, sig_label)
         if hist is not None and len(hist) >= self.strategy.min_samples:
-            self.strategy.train(hist, symbol=primary, timeframe_label=self.htf_label)
-            self.log.info("✅ Model trained on %d historical candles.", len(hist))
+            self.strategy.train(hist, symbol=primary, timeframe_label=sig_label)
+            self.log.info("✅ Model trained on %d historical candles [%s].", len(hist), sig_label)
         else:
-            # Fallback: use live candles
+            # Fallback: fetch live candles at the signal TF
             df = self.fetch_candles(primary)
             if df is not None and len(df) >= self.strategy.min_samples:
-                self.strategy.train(df, symbol=primary, timeframe_label=self.htf_label)
+                self.strategy.train(df, symbol=primary, timeframe_label=sig_label)
                 self.log.info("✅ Model trained on %d live candles (historical CSV not ready).",
                               len(df))
             else:
@@ -477,7 +503,7 @@ class TradingBot:
 
         self.startup()
 
-        interval = self.cfg["trading"]["loop_interval_s"]
+        # Read interval AFTER startup so any analysis-driven TF switch takes effect
         while True:
             try:
                 self.tick()
@@ -488,6 +514,7 @@ class TradingBot:
             except Exception as exc:
                 self.log.exception("Unexpected error in tick: %s", exc)
 
+            interval = self.cfg["trading"]["loop_interval_s"]
             self.log.info("💤 Next tick in %ds…", interval)
             time.sleep(interval)
 
