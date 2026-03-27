@@ -28,9 +28,12 @@ trading:
       enabled:    true
       allocation: 0.20
 
-  timeframe:        "240"     # Candle granularity in minutes (15 / 60 / 240 / 1440)
-  lookback_candles: 300       # Candles fetched for indicator calculation
-  loop_interval_s:  14400     # Run every N seconds (14400 = 4 h, matches timeframe)
+  timeframe:              "240"  # Signal candle granularity (minutes)
+  lookback_candles:       300    # Candles fetched per request
+  loop_interval_s:        14400  # Full tick interval — model retrain / summary (4 h)
+  entry_scan_interval_s:  900    # Entry-only scan when flat — catches new candles fast (15 min)
+  monitor_interval_s:     300    # SL/TP price check — gap protection (5 min)
+  ltf_reversal_tf:        "60"   # Lower TF for reversal exit signal (1h when trading 4h)
 
 risk:
   # Paper account = £100 equivalent in USDT
@@ -40,11 +43,17 @@ risk:
   risk_per_trade_abs:   5.0
 
   stop_loss_atr_mult:   1.5      # Stop-loss = 1.5 × ATR
-  take_profit_atr_mult: 3.0      # Take-profit = 3 × ATR  →  2 : 1 risk-reward
+  take_profit_atr_mult: 3.0      # Final TP = 3 × ATR  →  2 : 1 risk-reward
   min_rr_ratio:         1.5      # Reject any trade where actual R/R falls below 1.5
   max_open_positions:   2        # Only 2 concurrent positions (£100 account protection)
   max_daily_loss_abs:   10.0     # Auto-halt if we lose £10 in a single day
   max_leverage:         20       # Hard cap — leverage will never exceed this
+
+  # ── Multi-TP partial exit ──────────────────────────────────────────────────
+  # TP1: close half the position at 1:1 R/R, then move stop to breakeven.
+  # The remaining half rides until the final TP or an LTF reversal signal.
+  take_profit_1_atr_mult: 1.5    # TP1 at same distance as SL  →  1 : 1 R/R
+  take_profit_1_close_pct: 0.50  # Close 50 % of position at TP1
 
 strategy:
   # ── Signal thresholds ──────────────────────────────────────────────────────
@@ -77,7 +86,7 @@ strategy:
   # ── Labelling ──────────────────────────────────────────────────────────────
   min_training_samples:  60    # Don't train until we have at least 60 labelled samples
   label_horizon_candles:  4    # Look 4 candles forward to label BUY / HOLD / SELL
-  label_move_threshold: 0.005  # 0.5 % move counts as a meaningful directional move
+  label_move_threshold: 0.015  # 1.5 % move — meaningful on 4h candles, filters noise
 
 logging:
   log_file:    "logs/bot.log"
