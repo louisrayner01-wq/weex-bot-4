@@ -30,7 +30,7 @@ trading:
 
   timeframe:        "15"      # Candle granularity in minutes (15 / 60 / 240 / 1440)
   lookback_candles: 300       # Candles fetched for indicator calculation
-  loop_interval_s:  900      # Run every N seconds (3600 = 1 hour, matches timeframe)
+  loop_interval_s:  900       # Run every N seconds (900 = 15 min, matches timeframe)
 
 risk:
   # Paper account = £100 equivalent in USDT
@@ -48,8 +48,10 @@ risk:
 
 strategy:
   # ── Signal thresholds ──────────────────────────────────────────────────────
-  buy_threshold:    0.60   # Buy when calibrated probability > 60 %
-  sell_threshold:   0.40   # Exit when probability < 40 %
+  # Early-stage values — model has limited data so probabilities cluster near 0.33.
+  # Raise buy_threshold toward 0.55–0.60 once the bot has 50+ completed trades.
+  buy_threshold:    0.45   # Buy when calibrated probability > 45 %
+  sell_threshold:   0.35   # Exit when probability < 35 %
 
   # ── Trade quality gates (BOTH must pass before entering a trade) ───────────
   min_ev:           0.001  # Minimum Expected Value (EV > 0.1 % per trade)
@@ -82,3 +84,16 @@ logging:
   trades_file: "logs/trades.csv"
   models_dir:  "models/"
   level:       "INFO"
+
+# ── Data collection + analysis ──────────────────────────────────────────────
+data:
+  # Railway persistent volume mount path — set this up in Railway dashboard
+  # (Volumes tab → Add Volume → mount at /data)
+  data_dir:             "/data"
+
+  # Higher-timeframe used for confluence filtering.
+  # This is overridden automatically by the analysis if it finds a better one.
+  confluence_timeframe: "60"    # 1h filter applied on top of 15m signals
+
+  # Analysis results older than this many days trigger a fresh analysis run
+  analysis_stale_days:  7
