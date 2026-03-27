@@ -164,9 +164,10 @@ class TradingBot:
         return candles_to_df(raw)
 
     def live_price(self, symbol: str, df: pd.DataFrame) -> float:
-        ticker = self.client.get_ticker(symbol)
-        if ticker and "last" in ticker:
-            return float(ticker["last"])
+        # Use the most-recent candle close as our entry price reference.
+        # The Weex v3 ticker endpoint is currently unavailable; candle close
+        # price is accurate enough for hourly signal generation and paper trading.
+        # For live execution the order fills at the exchange's market price anyway.
         return float(df["close"].iloc[-1])
 
     def get_equity(self) -> float:
@@ -365,3 +366,4 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
