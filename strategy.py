@@ -31,15 +31,9 @@ import pandas as pd
 import joblib
 from typing import Tuple, Optional, List, Dict
 
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-    ExtraTreesClassifier,
-    VotingClassifier,
-)
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.feature_selection import SelectFromModel
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
 from indicators import FEATURE_COLS, compute_features
@@ -144,46 +138,24 @@ def retrain_frequency(total_trades: int, stages: List[Dict]) -> int:
 # Ensemble model builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_ensemble() -> CalibratedClassifierCV:
+def build_model() -> CalibratedClassifierCV:
     """
-    Three diverse models combined with soft voting, then wrapped in
-    isotonic calibration so predicted probabilities match real frequencies.
+    Single Random Forest wrapped in sigmoid calibration.
+    Kept lean (100 trees, depth 8) to run reliably within Railway's 512 MB RAM.
+    Calibration ensures predicted probabilities are accurate —
+    "65% confident" genuinely means ~65% likely.
     """
     rf = RandomForestClassifier(
-        n_estimators=250,
-        max_depth=10,
-        min_samples_leaf=4,
+        n_estimators=100,      # lean but reliable on ~300 samples
+        max_depth=8,
+        min_samples_leaf=5,
         max_features="sqrt",
         class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,              # single thread — more stable on small servers
     )
-    gb = GradientBoostingClassifier(
-        n_estimators=200,
-        learning_rate=0.05,
-        max_depth=5,
-        subsample=0.8,
-        min_samples_leaf=5,
-        random_state=42,
-    )
-    et = ExtraTreesClassifier(
-        n_estimators=250,
-        max_depth=10,
-        min_samples_leaf=4,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1,
-    )
-
-    ensemble = VotingClassifier(
-        estimators=[("rf", rf), ("gb", gb), ("et", et)],
-        voting="soft",           # use averaged probabilities, not majority vote
-        weights=[1.5, 2.0, 1.0], # GB gets more weight (typically more accurate)
-    )
-
-    # Isotonic calibration corrects the probability scale so
-    # "65% confident" actually means we're right ~65% of the time.
-    return CalibratedClassifierCV(ensemble, method="isotonic", cv=3)
+    # sigmoid calibration: fast, low memory, works well with RF
+    return CalibratedClassifierCV(rf, method="sigmoid", cv=3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,14 +244,10 @@ class TradingStrategy:
                         self.min_samples, len(X_raw))
             return
 
-        # ── Scale ─────────────────────────────────────────────────────────────
-        X_scaled = self.scaler.fit_transform(X_raw)
-        X_df     = pd.DataFrame(X_scaled, columns=available)
-
-        # ── Feature selection: drop bottom-10% importance features ────────────
-        prelim_rf = RandomForestClassifier(n_estimators=100, max_depth=6,
-                                           class_weight="balanced", random_state=42, n_jobs=-1)
-        prelim_rf.fit(X_df, y)
+        # ── Feature selection: rank importance on unscaled data ──────────────
+        prelim_rf = RandomForestClassifier(n_estimators=50, max_depth=5,
+                                           class_weight="balanced", random_state=42, n_jobs=1)
+        prelim_rf.fit(X_raw, y)
         importances = dict(zip(available, prelim_rf.feature_importances_))
         threshold   = np.percentile(list(importances.values()), 10)
         self.selected_features = [f for f, imp in importances.items() if imp >= threshold]
@@ -287,15 +255,20 @@ class TradingStrategy:
         logger.info("Feature selection: %d → %d features kept",
                     len(available), len(self.selected_features))
 
-        X_sel = X_df[self.selected_features]
+        # ── Scale ONLY the selected features — scaler must match predict() ───
+        X_sel_raw = X_raw[self.selected_features]
+        self.scaler = StandardScaler()
+        X_sel = pd.DataFrame(
+            self.scaler.fit_transform(X_sel_raw),
+            columns=self.selected_features
+        )
 
-        # ── Build + fit calibrated ensemble ──────────────────────────────────
-        self.model = build_ensemble()
+        # ── Build + fit lean calibrated model ─────────────────────────────────
+        self.model = build_model()
         self.model.fit(X_sel, y)
 
-        # ── Cross-val accuracy ────────────────────────────────────────────────
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        scores = cross_val_score(self.model, X_sel, y, cv=cv, scoring="accuracy")
+        # ── Cross-val accuracy (3-fold to save memory) ────────────────────────
+        scores = cross_val_score(self.model, X_sel, y, cv=3, scoring="accuracy")
         logger.info("🎯 Model trained | samples=%d | CV accuracy=%.2f±%.2f | features=%d",
                     len(X_sel), scores.mean(), scores.std(), len(self.selected_features))
 
@@ -320,24 +293,22 @@ class TradingStrategy:
             return HOLD, 0.0, 0.0
 
         X = self._prepare_X(df)
-        available = [c for c in self.selected_features if c in X.columns]
-        if not available or X.empty:
+        # Only use features the scaler was trained on
+        feats = [c for c in self.selected_features if c in X.columns]
+        if not feats or X.empty:
             return HOLD, 0.0, 0.0
 
-        last = X[available].iloc[[-1]]
         try:
-            X_scaled = self.scaler.transform(
-                pd.DataFrame(last.values, columns=available,
-                             index=last.index).reindex(columns=available)
+            last_row = X[feats].iloc[[-1]]
+            X_scaled = pd.DataFrame(
+                self.scaler.transform(last_row),
+                columns=feats
             )
-            X_sel = pd.DataFrame(X_scaled, columns=available)[self.selected_features
-                                                               if all(f in available for f in self.selected_features)
-                                                               else available]
         except Exception as exc:
             logger.debug("Prediction transform error: %s", exc)
             return HOLD, 0.0, 0.0
 
-        proba   = self.model.predict_proba(X_sel)[0]
+        proba   = self.model.predict_proba(X_scaled)[0]
         classes = list(self.model.classes_)
 
         buy_p  = float(proba[classes.index(BUY)])  if BUY  in classes else 0.0
@@ -405,3 +376,4 @@ class TradingStrategy:
 
     def best_pairs(self) -> Dict[str, float]:
         return self.stats.rank_pairs()
+
