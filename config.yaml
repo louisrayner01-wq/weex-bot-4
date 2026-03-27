@@ -97,3 +97,4 @@ data:
 
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  7
+
