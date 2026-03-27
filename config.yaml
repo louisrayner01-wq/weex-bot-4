@@ -28,9 +28,9 @@ trading:
       enabled:    true
       allocation: 0.20
 
-  timeframe:        "15"      # Candle granularity in minutes (15 / 60 / 240 / 1440)
+  timeframe:        "240"     # Candle granularity in minutes (15 / 60 / 240 / 1440)
   lookback_candles: 300       # Candles fetched for indicator calculation
-  loop_interval_s:  900       # Run every N seconds (900 = 15 min, matches timeframe)
+  loop_interval_s:  14400     # Run every N seconds (14400 = 4 h, matches timeframe)
 
 risk:
   # Paper account = £100 equivalent in USDT
@@ -93,7 +93,7 @@ data:
 
   # Higher-timeframe used for confluence filtering.
   # This is overridden automatically by the analysis if it finds a better one.
-  confluence_timeframe: "60"    # 1h filter applied on top of 15m signals
+  confluence_timeframe: "1440"  # 1d filter applied on top of 4h signals
 
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  7
