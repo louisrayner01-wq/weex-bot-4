@@ -587,15 +587,17 @@ class TradingBot:
         if self.risk.trading_halted():
             return
 
-        self.log.debug("🔍 Entry scan @ %s", utcnow().strftime("%H:%M UTC"))
+        results = []   # collect per-pair results into one summary log line
 
         for pair_cfg in self.pairs:
             symbol = pair_cfg["symbol"]
+            name   = pair_cfg["name"]
             if symbol in self.risk.open_positions:
                 continue
 
             df = self.fetch_candles(symbol)
             if df is None or len(df) < 60:
+                results.append(f"{name}→NO_DATA")
                 continue
 
             price = self.live_price(symbol, df)
@@ -606,9 +608,22 @@ class TradingBot:
                 htf_df = self.fetch_candles(symbol, tf=self.htf_tf, limit=100)
             htf_direction = self.strategy.htf_trend(htf_df) if htf_df is not None else 0
 
+            # Peek at probabilities for the summary line
+            signal, buy_p, sell_p = self.strategy.predict(df)
+            signal, buy_p, sell_p = self.strategy.apply_confluence(
+                signal, buy_p, sell_p, htf_direction
+            )
+
+            if signal == 0:   # HOLD
+                results.append(f"{name}→HOLD(b{buy_p:.2f}/s{sell_p:.2f})")
+                continue
+
+            # Non-HOLD signal — run full gate checks via _try_enter
             entered = self._try_enter(symbol, df, price, atr, htf_direction)
-            if entered:
-                self.log.info("✅ Entry scan opened trade on %s", symbol)
+            results.append(f"{name}→{'ENTERED' if entered else 'BLOCKED'}")
+
+        self.log.info("🔍 Scan @ %s  |  %s",
+                      utcnow().strftime("%H:%M UTC"), "  ".join(results))
 
     # ── Main tick ─────────────────────────────────────────────────────────────
 
