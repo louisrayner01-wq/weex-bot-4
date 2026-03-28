@@ -50,6 +50,7 @@ from trade_logger  import TradeLogger
 from data_collector import DataCollector, TF_LABELS
 from analysis      import Analyzer
 from mae_analyser  import MAEAnalyser
+from historical_mae import run_historical_mae
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +333,15 @@ class TradingBot:
         except Exception as exc:
             self.log.error("Training error (continuing anyway): %s", exc)
 
-        # ── Step 4: MAE / MFE stop-loss optimisation (if enough trade history) ──
+        # ── Step 4a: Historical MAE backtest — calibrate SL/TP before trade #1 ───
+        # Runs a walk-forward simulation on historical OHLCV data so the bot
+        # starts with an evidence-based SL rather than a hardcoded default.
+        try:
+            self._run_historical_mae()
+        except Exception as exc:
+            self.log.warning("Historical MAE error (non-fatal): %s", exc)
+
+        # ── Step 4b: Live MAE analysis — refines SL from real closed trades ────
         try:
             self._run_mae_analysis()
         except Exception as exc:
@@ -471,6 +480,59 @@ class TradingBot:
             self.log.info("📐 MAE suggestion: sl_atr_mult %.2f (current %.2f) — "
                           "need %d+ trades to auto-apply (have %d)",
                           suggested, current_mult, MIN_TRADES_FOR_AUTO, n_trades)
+
+    def _run_historical_mae(self):
+        """
+        Walk-forward MAE/MFE backtest on historical CSV data.
+        Runs ONCE at startup (after _initial_train) so the bot has a
+        data-driven SL calibration before trade #1 is ever opened.
+
+        Unlike _run_mae_analysis() (which reads the live trade log),
+        this uses price history to simulate hundreds of entries and
+        measures how far the market typically moves against the signal
+        before resolving — giving an evidence-based starting SL.
+
+        The suggested multipliers are applied immediately (no minimum
+        trade count needed) because they come from real price data,
+        not a live performance log.
+        """
+        self.log.info("📐 Running historical MAE backtest…")
+        result = run_historical_mae(
+            strategy   = self.strategy,
+            symbol_tf  = self.symbol_tf,
+            pairs      = self.pairs,
+            data_dir   = self.data_dir,
+            sl_mult    = self.risk.sl_atr_mult,
+            tp_mult    = self.risk.tp_atr_mult,
+        )
+
+        if not result or result.get("simulated_trades", 0) < 15:
+            self.log.info("📐 Historical MAE: insufficient data — "
+                          "will calibrate from live trades once they accumulate.")
+            return
+
+        suggested_sl = result.get("suggested_sl_atr_mult")
+        suggested_tp = result.get("suggested_tp_atr_mult")
+        conf         = result.get("confidence", "low")
+
+        # Apply SL suggestion — always apply from historical data, but widen
+        # the tolerance slightly for low-confidence estimates
+        sl_tol = 0.05 if conf == "high" else 0.15   # only apply if diff > tol
+        if suggested_sl and abs(suggested_sl - self.risk.sl_atr_mult) > sl_tol:
+            old = self.risk.sl_atr_mult
+            self.risk.sl_atr_mult = suggested_sl
+            self.log.info("⚙️  Historical MAE → sl_atr_mult: %.2f → %.2f  [%s confidence]",
+                          old, suggested_sl, conf)
+        else:
+            self.log.info("⚙️  Historical MAE: SL unchanged (%.2f) — already well-calibrated",
+                          self.risk.sl_atr_mult)
+
+        # Apply TP suggestion (only if it improves R/R relative to new SL)
+        if suggested_tp and suggested_tp >= self.risk.sl_atr_mult * 1.5:
+            old = self.risk.tp_atr_mult
+            self.risk.tp_atr_mult = suggested_tp
+            self.log.info("⚙️  Historical MAE → tp_atr_mult: %.2f → %.2f  [%s confidence]",
+                          old, suggested_tp, conf)
 
     # ── LTF reversal detector ─────────────────────────────────────────────────
 
@@ -908,6 +970,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
 
 
