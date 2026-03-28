@@ -549,7 +549,7 @@ class TradingStrategy:
 
         if buy_p >= self.buy_threshold:
             return BUY,  buy_p, sell_p
-        if sell_p >= self.buy_threshold:
+        if sell_p >= self.sell_threshold:
             return SELL, buy_p, sell_p
         return HOLD, buy_p, sell_p
 
@@ -610,6 +610,7 @@ class TradingStrategy:
 
     def best_pairs(self) -> Dict[str, float]:
         return self.stats.rank_pairs()
+
 
 
 
