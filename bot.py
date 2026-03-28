@@ -74,6 +74,11 @@ def load_config(path: str = "config.yaml") -> dict:
     if os.getenv("RISK_PER_TRADE"):
         cfg["risk"]["risk_per_trade_abs"] = float(os.getenv("RISK_PER_TRADE"))
 
+    # BASE_URL — override the Weex API base URL if the primary domain changes.
+    # e.g.  BASE_URL=https://api-spot.weex.com
+    if os.getenv("BASE_URL"):
+        cfg["exchange"]["base_url"] = os.environ["BASE_URL"]
+
     # FORCE_RETRAIN=true  — wipe saved models and retrain from scratch on next startup.
     # Remove the variable once models are generating healthy signals.
     # (Consumed in startup(), not stored in cfg — just documented here.)
@@ -320,7 +325,8 @@ class TradingBot:
         # ── Step 2: Analysis ──────────────────────────────────────────────────
         self.log.info("STEP 2/3  Strategy analysis")
         try:
-            if not self.analyzer.results_are_fresh(max_age_days=7):
+            stale_days = self.cfg.get("strategy", {}).get("analysis_stale_days", 7)
+            if not self.analyzer.results_are_fresh(max_age_days=stale_days):
                 self.analyzer.run()
             else:
                 self.log.info("  Analysis results are fresh — skipping re-run.")
@@ -996,7 +1002,6 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
-
 
 
 
