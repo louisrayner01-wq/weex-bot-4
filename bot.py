@@ -49,6 +49,7 @@ from risk_manager  import RiskManager, Position
 from trade_logger  import TradeLogger
 from data_collector import DataCollector, TF_LABELS
 from analysis      import Analyzer
+from mae_analyser  import MAEAnalyser
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,6 +332,12 @@ class TradingBot:
         except Exception as exc:
             self.log.error("Training error (continuing anyway): %s", exc)
 
+        # ── Step 4: MAE / MFE stop-loss optimisation (if enough trade history) ──
+        try:
+            self._run_mae_analysis()
+        except Exception as exc:
+            self.log.warning("MAE analysis error (non-fatal): %s", exc)
+
         self.log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         self.log.info("  STARTUP COMPLETE — entering trading loop")
         self.log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -435,6 +442,36 @@ class TradingBot:
                     n = len(df) if df is not None else 0
                     self.log.info("⚠️  %s: only %d candles — will train once data builds up.", name, n)
 
+    def _run_mae_analysis(self):
+        """
+        Run MAE/MFE stop-loss optimisation analysis against the trade log.
+        Logs suggestions.  If confidence is high (≥50 trades) and the suggested
+        sl_atr_mult differs meaningfully from the current one, auto-updates it.
+        """
+        trades_file = self.cfg["logging"].get("trades_file", "/data/trades.csv")
+        analyser    = MAEAnalyser(trades_file)
+        current_mult = self.risk.sl_atr_mult
+
+        report = analyser.analyse(current_sl_atr_mult=current_mult)
+        if not report:
+            return
+
+        suggested = report.get("suggested_sl_atr_mult", current_mult)
+        n_trades  = report.get("total_trades", 0)
+
+        # Auto-apply only when we have enough data and a meaningful difference
+        from mae_analyser import MIN_TRADES_FOR_AUTO, AUTO_APPLY_MARGIN
+        diff = abs(suggested - current_mult)
+        if n_trades >= MIN_TRADES_FOR_AUTO and diff > AUTO_APPLY_MARGIN * current_mult:
+            self.risk.sl_atr_mult = suggested
+            self.log.info("⚙️  MAE auto-applied: sl_atr_mult %.2f → %.2f "
+                          "(%d trades, diff %.2f)",
+                          current_mult, suggested, n_trades, diff)
+        elif n_trades > 0:
+            self.log.info("📐 MAE suggestion: sl_atr_mult %.2f (current %.2f) — "
+                          "need %d+ trades to auto-apply (have %d)",
+                          suggested, current_mult, MIN_TRADES_FOR_AUTO, n_trades)
+
     # ── LTF reversal detector ─────────────────────────────────────────────────
 
     def _ltf_reversal(self, df_ltf: pd.DataFrame, side: str) -> bool:
@@ -536,6 +573,10 @@ class TradingBot:
             self.log.warning("  ⚠️  %s  Position size is 0 — check ATR/equity", symbol)
             return False
 
+        # Capture entry candle's wick levels for MAE wick-breach detection
+        entry_candle_low  = float(df["low"].iloc[-1])  if "low"  in df.columns else 0.0
+        entry_candle_high = float(df["high"].iloc[-1]) if "high" in df.columns else 0.0
+
         if signal == BUY:
             order_id = self._open_long(symbol, qty, price)
             if order_id:
@@ -547,6 +588,8 @@ class TradingBot:
                     leverage=leverage,
                     entry_time=utcnow().isoformat(),
                     order_id=order_id,
+                    entry_candle_low=entry_candle_low,
+                    entry_candle_high=entry_candle_high,
                 )
                 self.risk.open_position(pos)
                 self.log.info("🟢 LONG opened  %s  qty=%.5f @ £%.4f  SL=£%.4f  TP=£%.4f",
@@ -564,6 +607,8 @@ class TradingBot:
                     leverage=leverage,
                     entry_time=utcnow().isoformat(),
                     order_id=order_id,
+                    entry_candle_low=entry_candle_low,
+                    entry_candle_high=entry_candle_high,
                 )
                 self.risk.open_position(pos)
                 self.log.info("🔴 SHORT opened  %s  qty=%.5f @ £%.4f  SL=£%.4f  TP=£%.4f",
@@ -597,6 +642,9 @@ class TradingBot:
             if df is None or df.empty:
                 continue
             price = self.live_price(symbol, df)
+
+            # Update MAE / MFE before checking exits (records worst/best price seen)
+            self.risk.update_excursion(symbol, price)
 
             exit_reason = self.risk.should_exit(symbol, price)
 
@@ -785,6 +833,13 @@ class TradingBot:
                 self.log.info("📊 Pair ranking by EV: %s",
                               {k: f"{v*100:+.3f}%" for k, v in top_pairs.items()})
 
+        # MAE/MFE stop-loss optimisation — re-run every 10 ticks (~40h)
+        if self._tick_count % 10 == 0:
+            try:
+                self._run_mae_analysis()
+            except Exception as exc:
+                self.log.warning("MAE analysis error: %s", exc)
+
         self._tick_count += 1
 
     # ── Run loop ──────────────────────────────────────────────────────────────
@@ -853,6 +908,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
 
 
