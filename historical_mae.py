@@ -81,13 +81,26 @@ HOLDOUT_FRACTION = 0.30
 # Minimum simulated trades needed for the result to be meaningful
 MIN_SIM_TRADES   = 15
 
-# Confidence thresholds for accepting a signal (match bot defaults)
-DEFAULT_BUY_THRESHOLD  = 0.60
-DEFAULT_SELL_THRESHOLD = 0.40
+# Confidence thresholds for the historical backtest.
+# Deliberately looser than the live bot thresholds (0.60/0.40) so that
+# overfit models — which assign near-zero probabilities to everything
+# in the holdout window — still generate enough signals for calibration.
+DEFAULT_BUY_THRESHOLD  = 0.45
+DEFAULT_SELL_THRESHOLD = 0.35
 
 # Clamp on suggested multipliers
 MIN_MULT = 0.5
-MAX_MULT = 5.0
+MAX_MULT = 3.5   # tighter ceiling — 5x would mean a near-useless SL
+
+# Sanity gate: if the optimal MAE% is more than this multiple of the
+# median ATR%, the winner/loser distributions overlap too heavily
+# (usually means the model is not providing useful signal separation).
+# Skip calibration for that symbol and keep the current multiplier.
+MAX_MAE_ATR_RATIO = 2.5
+
+# Maximum single-deployment change to sl_atr_mult (50% up or down).
+# Prevents a single noisy result from doubling or halving the stop.
+MAX_MULT_CHANGE_FACTOR = 0.50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,108 +455,175 @@ class HistoricalMAEBacktest:
     def _optimise(self, all_trades: List[dict],
                   per_pair: Dict[str, dict]) -> dict:
         """
-        Find optimal sl_atr_mult and tp_atr_mult from the simulated trades.
+        Find optimal sl_atr_mult and tp_atr_mult by optimising PER SYMBOL,
+        then taking the median across symbols that passed the sanity check.
+
+        Why per-symbol rather than aggregate?
+        Mixing 1d BTC trades (ATR ~2.5%) with 15m ETH trades (ATR ~0.15%)
+        in one MAE distribution produces a nonsense threshold driven entirely
+        by the highest-ATR pair.  Each pair calibrates its own SL using its
+        own ATR as the denominator, then we take the median suggested multiplier
+        across all symbols.
+
+        Sanity check: if the optimal MAE% is > MAX_MAE_ATR_RATIO × median ATR%,
+        the winner/loser distributions overlap too badly (usually a sign the
+        model is not producing useful signal separation on that pair/TF).
+        We skip that pair and log a warning rather than let it corrupt the result.
         """
-        from mae_analyser import KEEP_PCT, CUT_PCT, _percentile as pct
+        sym_sl_suggestions: List[float] = []
+        sym_tp_suggestions: List[float] = []
 
-        winners = [t for t in all_trades if     t["win"]]
-        losers  = [t for t in all_trades if not t["win"]]
+        # Group trades by symbol+TF
+        groups: Dict[str, List[dict]] = {}
+        for t in all_trades:
+            key = f"{t['symbol']}_{t['tf']}"
+            groups.setdefault(key, []).append(t)
 
-        if not winners or not losers:
-            logger.info("📐 Historical MAE: need both wins and losses to calibrate.")
-            return {"simulated_trades": len(all_trades), "per_pair": per_pair}
+        for key, trades in groups.items():
+            winners = [t for t in trades if     t["win"]]
+            losers  = [t for t in trades if not t["win"]]
+            if len(winners) < 3 or len(losers) < 3:
+                logger.info("  %s: too few W/L for per-symbol calibration (%dW/%dL) — skipping",
+                            key, len(winners), len(losers))
+                continue
 
-        win_maes  = sorted(t["mae_pct"] for t in winners)
-        loss_maes = sorted(t["mae_pct"] for t in losers)
-        win_mfes  = [t["mfe_pct"] for t in winners]
-        atr_pcts  = [t["atr_pct"] for t in all_trades if t["atr_pct"] > 0]
+            win_maes  = sorted(t["mae_pct"] for t in winners)
+            loss_maes = sorted(t["mae_pct"] for t in losers)
+            win_mfes  = [t["mfe_pct"] for t in winners]
+            atr_pcts  = [t["atr_pct"] for t in trades if t["atr_pct"] > 0]
 
-        # ── Find optimal SL threshold ─────────────────────────────────────────
-        optimal_sl_pct, keep, cut = _find_threshold(win_maes, loss_maes)
+            optimal_sl_pct, keep, cut = _find_threshold(win_maes, loss_maes)
+            median_atr_pct = _percentile(sorted(atr_pcts), 50) if atr_pcts else 0.0
 
-        # ── Convert to sl_atr_mult ────────────────────────────────────────────
-        median_atr_pct = _percentile(sorted(atr_pcts), 50) if atr_pcts else 1.0
-        if median_atr_pct > 0:
-            suggested_sl_mult = round(
+            if median_atr_pct <= 0:
+                logger.info("  %s: ATR%% is zero — skipping", key)
+                continue
+
+            # ── Sanity check: reject if distributions too mixed ────────────────
+            ratio = optimal_sl_pct / median_atr_pct
+            if ratio > MAX_MAE_ATR_RATIO:
+                logger.info(
+                    "  %s: optimal SL %.3f%% = %.1f× ATR (max %.1f×) — "
+                    "winner/loser distributions overlap too much, skipping.",
+                    key, optimal_sl_pct, ratio, MAX_MAE_ATR_RATIO
+                )
+                continue
+
+            sl_mult_sym = round(
                 max(MIN_MULT, min(MAX_MULT, optimal_sl_pct / median_atr_pct)), 2
             )
-        else:
-            suggested_sl_mult = self.sl_mult
-
-        # ── Suggest TP from MFE ───────────────────────────────────────────────
-        # Use P70 of winner MFE as a realistic TP target (not the rare big winner)
-        p70_mfe = _percentile(sorted(win_mfes), 70) if win_mfes else 0.0
-        if median_atr_pct > 0 and p70_mfe > 0:
-            suggested_tp_mult = round(
+            p70_mfe = _percentile(sorted(win_mfes), 70) if win_mfes else 0.0
+            tp_mult_sym = round(
                 max(MIN_MULT, min(MAX_MULT, p70_mfe / median_atr_pct)), 2
+            ) if p70_mfe > 0 else None
+
+            logger.info(
+                "  %s: opt_SL=%.3f%%  ATR%%=%.3f%%  → sl_mult=%.2f  "
+                "(keeps %.1f%% W, cuts %.1f%% L)",
+                key, optimal_sl_pct, median_atr_pct, sl_mult_sym,
+                keep * 100, cut * 100
             )
+            sym_sl_suggestions.append(sl_mult_sym)
+            if tp_mult_sym is not None:
+                sym_tp_suggestions.append(tp_mult_sym)
+
+        if not sym_sl_suggestions:
+            logger.info("📐 Historical MAE: no symbols passed the sanity check — "
+                        "keeping current SL mult (%.2f).", self.sl_mult)
+            return {
+                "simulated_trades": len(all_trades),
+                "suggested_sl_atr_mult": self.sl_mult,
+                "suggested_tp_atr_mult": self.tp_mult,
+                "per_pair": per_pair,
+                "skipped_calibration": True,
+            }
+
+        # ── Aggregate: median of per-symbol suggestions ───────────────────────
+        sym_sl_suggestions.sort()
+        suggested_sl_mult = round(_percentile(sym_sl_suggestions, 50), 2)
+
+        # Apply the max-single-change cap (don't move more than 50% in one go)
+        max_change  = self.sl_mult * MAX_MULT_CHANGE_FACTOR
+        suggested_sl_mult = round(
+            max(self.sl_mult - max_change,
+                min(self.sl_mult + max_change, suggested_sl_mult)), 2
+        )
+
+        if sym_tp_suggestions:
+            sym_tp_suggestions.sort()
+            suggested_tp_mult = round(_percentile(sym_tp_suggestions, 50), 2)
+            suggested_tp_mult = max(MIN_MULT, min(MAX_MULT, suggested_tp_mult))
         else:
             suggested_tp_mult = self.tp_mult
 
-        # Make sure R/R is at least 1.5:1 (don't set a worse TP than current)
+        # Ensure minimum R/R of 1.5:1
         if suggested_tp_mult < suggested_sl_mult * 1.5:
             suggested_tp_mult = round(suggested_sl_mult * 2.0, 2)
 
-        # ── Wick breach rate ──────────────────────────────────────────────────
+        # ── Wick breach across all trades ─────────────────────────────────────
+        winners_all = [t for t in all_trades if     t["win"]]
+        losers_all  = [t for t in all_trades if not t["win"]]
         wick_total  = sum(t["wick_breach"] for t in all_trades)
-        wick_win    = sum(t["wick_breach"] for t in winners)
-        wick_loss   = sum(t["wick_breach"] for t in losers)
-        wick_rate   = wick_total / len(all_trades) * 100 if all_trades else 0
-        wick_win_r  = wick_win   / max(len(winners), 1)  * 100
-        wick_loss_r = wick_loss  / max(len(losers),  1)  * 100
+        wick_win    = sum(t["wick_breach"] for t in winners_all)
+        wick_loss   = sum(t["wick_breach"] for t in losers_all)
+        wick_rate   = wick_total / max(len(all_trades), 1) * 100
+        wick_win_r  = wick_win   / max(len(winners_all), 1) * 100
+        wick_loss_r = wick_loss  / max(len(losers_all),  1) * 100
 
-        # ── Confidence level ──────────────────────────────────────────────────
         n = len(all_trades)
         confidence = "high" if n >= 100 else "medium" if n >= 30 else "low"
 
+        all_win_maes  = sorted(t["mae_pct"] for t in winners_all)
+        all_loss_maes = sorted(t["mae_pct"] for t in losers_all)
+        all_win_mfes  = [t["mfe_pct"] for t in winners_all]
+
         result = {
-            "simulated_trades":    n,
-            "wins":                len(winners),
-            "losses":              len(losers),
-            "win_mae_p50":         round(_percentile(win_maes,  50), 3),
-            "win_mae_p80":         round(_percentile(win_maes,  80), 3),
-            "loss_mae_p50":        round(_percentile(loss_maes, 50), 3),
-            "optimal_sl_pct":      round(optimal_sl_pct, 3),
-            "keep_winners_pct":    round(keep * 100, 1),
-            "cut_losers_pct":      round(cut  * 100, 1),
-            "median_atr_pct":      round(median_atr_pct, 3),
+            "simulated_trades":      n,
+            "wins":                  len(winners_all),
+            "losses":                len(losers_all),
+            "symbols_calibrated":    len(sym_sl_suggestions),
+            "win_mae_p50":           round(_percentile(all_win_maes,  50), 3) if all_win_maes  else 0,
+            "win_mae_p80":           round(_percentile(all_win_maes,  80), 3) if all_win_maes  else 0,
+            "loss_mae_p50":          round(_percentile(all_loss_maes, 50), 3) if all_loss_maes else 0,
+            "per_symbol_sl_mults":   sym_sl_suggestions,
             "suggested_sl_atr_mult": suggested_sl_mult,
             "suggested_tp_atr_mult": suggested_tp_mult,
-            "current_sl_atr_mult": self.sl_mult,
-            "current_tp_atr_mult": self.tp_mult,
-            "wick_breach_rate":    round(wick_rate, 1),
-            "wick_win_rate":       round(wick_win_r, 1),
-            "wick_loss_rate":      round(wick_loss_r, 1),
-            "p70_mfe_winner":      round(p70_mfe, 3),
-            "confidence":          confidence,
-            "per_pair":            per_pair,
+            "current_sl_atr_mult":   self.sl_mult,
+            "current_tp_atr_mult":   self.tp_mult,
+            "wick_breach_rate":      round(wick_rate, 1),
+            "wick_win_rate":         round(wick_win_r, 1),
+            "wick_loss_rate":        round(wick_loss_r, 1),
+            "p70_mfe_winner":        round(_percentile(sorted(all_win_mfes), 70), 3) if all_win_mfes else 0,
+            "confidence":            confidence,
+            "per_pair":              per_pair,
         }
 
         self._log_report(result)
         return result
 
     def _log_report(self, r: dict):
-        n   = r["simulated_trades"]
-        conf = r["confidence"].upper()
+        n    = r["simulated_trades"]
+        conf = r.get("confidence", "?").upper()
+        n_sym = r.get("symbols_calibrated", "?")
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         logger.info("  📐 HISTORICAL MAE BACKTEST  [confidence: %s]", conf)
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        logger.info("  Simulated trades : %d  (%d W / %d L)",
-                    n, r["wins"], r["losses"])
-        logger.info("  Median ATR%%      : %.3f%% of entry price", r["median_atr_pct"])
+        logger.info("  Simulated trades  : %d  (%d W / %d L)  across %s symbol(s)",
+                    n, r.get("wins", 0), r.get("losses", 0), n_sym)
+        logger.info("  Per-symbol SL mults: %s",
+                    [f"{v:.2f}" for v in r.get("per_symbol_sl_mults", [])])
         logger.info("")
         logger.info("  ── Winner MAE (adverse move before recovering) ──────")
-        logger.info("  P50: %.3f%%   P80: %.3f%%", r["win_mae_p50"], r["win_mae_p80"])
+        logger.info("  P50: %.3f%%   P80: %.3f%%",
+                    r.get("win_mae_p50", 0), r.get("win_mae_p80", 0))
         logger.info("  ── Loser MAE ─────────────────────────────────────────")
-        logger.info("  P50: %.3f%%", r["loss_mae_p50"])
+        logger.info("  P50: %.3f%%", r.get("loss_mae_p50", 0))
         logger.info("")
-        logger.info("  Optimal SL : %.3f%% from entry"
-                    "  →  keeps %.1f%% of winners,  cuts %.1f%% of losers",
-                    r["optimal_sl_pct"], r["keep_winners_pct"], r["cut_losers_pct"])
         logger.info("  SL mult:  current=%.2f  →  suggested=%.2f",
                     r["current_sl_atr_mult"], r["suggested_sl_atr_mult"])
         logger.info("  TP mult:  current=%.2f  →  suggested=%.2f  (from P70 MFE=%.3f%%)",
-                    r["current_tp_atr_mult"], r["suggested_tp_atr_mult"], r["p70_mfe_winner"])
+                    r["current_tp_atr_mult"], r["suggested_tp_atr_mult"],
+                    r.get("p70_mfe_winner", 0))
 
         sl_diff = r["suggested_sl_atr_mult"] - r["current_sl_atr_mult"]
         if abs(sl_diff) < 0.1:
