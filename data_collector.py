@@ -7,16 +7,26 @@ Saves to /data/{SYMBOL}_{TIMEFRAME}.csv  (Railway persistent volume).
 Timeframes collected : 5m, 15m, 1h, 4h, 1d
 Symbols              : BTCUSDT, ETHUSDT, SOLUSDT
 
-Append strategy
-───────────────
-Instead of overwriting the CSV on each run, the collector loads the
-existing file, finds the latest saved timestamp, fetches the newest
-batch from the API, and appends only the candles that are genuinely
-new.  This means the CSVs grow indefinitely — giving the analysis
-and ML model ever-increasing history to learn from.
+Initial fetch (no CSV exists)
+──────────────────────────────
+On the very first run, the collector paginates backwards from the current
+time — fetching 1 000 candles per request, stepping endTime back to the
+oldest candle seen so far — until it has collected the full target window
+defined in INITIAL_FETCH_DAYS.  This gives every model 2 years of training
+data right from the first deployment.
 
-On first run (no CSV exists): saves the initial 301-candle batch.
-On subsequent runs: appends only candles newer than the last row.
+Target windows:
+  5m  → 60 days   (~17 280 candles — used for monitoring, not training)
+  15m → 730 days  (~70 080 candles — ETH training timeframe)
+  1h  → 730 days  (~17 520 candles)
+  4h  → 730 days  (~4 380 candles  — BTC/SOL training timeframe)
+  1d  → 730 days  (~730 candles)
+
+Append strategy (CSV already exists)
+──────────────────────────────────────
+Loads the existing file, finds the latest saved timestamp, fetches the
+newest batch, and appends only candles that are genuinely new.
+The CSVs grow continuously — giving the ML model ever-increasing history.
 
 Refresh rate
 ────────────
@@ -26,7 +36,6 @@ Each timeframe refreshes at its own natural cadence:
   1h  → skip if last candle < 60 min old
   4h  → skip if last candle < 4 h old
   1d  → skip if last candle < 24 h old
-This avoids redundant API calls while keeping data up to date.
 """
 
 import os
@@ -53,11 +62,9 @@ TF_LABELS = {
 
 SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-REQUEST_DELAY = 0.4   # seconds between requests (rate-limit safety)
+REQUEST_DELAY = 0.5   # seconds between requests (rate-limit safety)
 
 # Minimum age of the most-recent candle before we bother fetching again.
-# Set to 1× the timeframe period so we only call the API when at least
-# one new candle has had a chance to close.
 TF_REFRESH_MINUTES = {
     "5":    5,
     "15":   15,
@@ -65,6 +72,19 @@ TF_REFRESH_MINUTES = {
     "240":  240,
     "1440": 1440,
 }
+
+# How many days of history to fetch on the very first run (no CSV exists).
+# Shorter timeframes accumulate fast, so 5m is capped at 60 days to avoid
+# thousands of API calls on first boot.
+INITIAL_FETCH_DAYS = {
+    "5":     60,   # ~17 280 candles in ~18 batches
+    "15":   730,   # ~70 080 candles in ~71 batches
+    "60":   730,   # ~17 520 candles in ~18 batches
+    "240":  730,   # ~4 380 candles in ~5 batches
+    "1440": 730,   # ~730 candles in 1 batch
+}
+
+BATCH_SIZE = 1000   # candles per API request
 
 
 # ── Core collector ────────────────────────────────────────────────────────────
@@ -86,7 +106,7 @@ class DataCollector:
 
         quiet=True suppresses the header/progress lines — used for the
         background accumulation calls that run every 5 minutes so they
-        don't flood the logs.  Appends and errors still log at INFO/ERROR.
+        don't flood the logs.
         """
         total = len(SYMBOLS) * len(TIMEFRAMES)
         done  = 0
@@ -112,20 +132,13 @@ class DataCollector:
         """
         Fetch and APPEND new candles for one symbol/timeframe.
 
-        Logic:
-          1. Load the existing CSV (if any).
-          2. Check whether at least one new candle has had time to close —
-             if the most-recent saved candle is still within the current
-             candle period, skip (no new data to collect).
-          3. Fetch the latest batch from the API.
-          4. Append only the candles newer than the last saved timestamp,
-             deduplicate, sort, and save.
+        First run (no CSV): paginates backwards to collect INITIAL_FETCH_DAYS
+        of history so the models have real training data immediately.
 
-        Over time the CSV grows continuously, giving the ML model an
-        ever-richer history to learn from.
+        Subsequent runs: appends only candles newer than the last saved row.
         """
-        label    = TF_LABELS.get(timeframe_min, timeframe_min + "m")
-        filepath = self._filepath(symbol, label)
+        label       = TF_LABELS.get(timeframe_min, timeframe_min + "m")
+        filepath    = self._filepath(symbol, label)
         refresh_min = TF_REFRESH_MINUTES.get(timeframe_min, 60)
 
         # ── Load existing data ────────────────────────────────────────────────
@@ -139,20 +152,35 @@ class DataCollector:
                 logger.warning("Could not load %s: %s — will re-fetch.", filepath, exc)
                 existing = None
 
-        # ── Freshness check ───────────────────────────────────────────────────
+        # ── Freshness check (only skip if CSV already has data) ───────────────
         if existing is not None and not existing.empty:
-            last_ts    = existing["timestamp"].max()
-            now_utc    = pd.Timestamp.now('UTC').tz_localize(None)
-            age_min    = (now_utc - last_ts).total_seconds() / 60
+            last_ts  = existing["timestamp"].max()
+            now_utc  = pd.Timestamp.now('UTC').tz_localize(None)
+            age_min  = (now_utc - last_ts).total_seconds() / 60
             if age_min < refresh_min:
                 log = logger.debug if quiet else logger.info
                 log("  FRESH   %s %s  — last candle %.0f min ago (refresh at %d min)",
                     symbol, label, age_min, refresh_min)
                 return existing
 
-        # ── Fetch latest batch ────────────────────────────────────────────────
+        # ── First run: paginate backwards to collect full history ─────────────
+        if existing is None or existing.empty:
+            days = INITIAL_FETCH_DAYS.get(timeframe_min, 730)
+            logger.info("  BACKFILL  %s %s  — fetching %d days of history…",
+                        symbol, label, days)
+            raw = self._fetch_history_paginated(symbol, timeframe_min, days)
+            if not raw:
+                logger.warning("  No data returned for %s %s", symbol, label)
+                return None
+            new_df = self._to_dataframe(raw)
+            new_df.to_csv(filepath, index=False)
+            logger.info("  SAVED   %s %s  → %d candles  (%d days backfill)",
+                        symbol, label, len(new_df), days)
+            return new_df
+
+        # ── Subsequent runs: append latest candles ────────────────────────────
         logger.info("  FETCH   %s %s  …", symbol, label)
-        raw = self._fetch_history(symbol, timeframe_min)
+        raw = self._fetch_latest(symbol, timeframe_min)
 
         if not raw:
             logger.warning("  No data returned for %s %s", symbol, label)
@@ -160,27 +188,20 @@ class DataCollector:
 
         new_df = self._to_dataframe(raw)
 
-        # ── Append or initialise ──────────────────────────────────────────────
-        if existing is not None and not existing.empty:
-            combined = pd.concat([existing, new_df], ignore_index=True)
-            combined = (combined
-                        .drop_duplicates("timestamp")
-                        .sort_values("timestamp")
-                        .reset_index(drop=True))
-            n_new = len(combined) - len(existing)
-            if n_new > 0:
-                combined.to_csv(filepath, index=False)
-                logger.info("  APPEND  %s %s  +%d new candles → %d total",
-                            symbol, label, n_new, len(combined))
-            else:
-                logger.info("  UP-TO-DATE  %s %s  (%d candles, nothing new)",
-                            symbol, label, len(existing))
-            return combined
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = (combined
+                    .drop_duplicates("timestamp")
+                    .sort_values("timestamp")
+                    .reset_index(drop=True))
+        n_new = len(combined) - len(existing)
+        if n_new > 0:
+            combined.to_csv(filepath, index=False)
+            logger.info("  APPEND  %s %s  +%d new candles → %d total",
+                        symbol, label, n_new, len(combined))
         else:
-            new_df.to_csv(filepath, index=False)
-            logger.info("  SAVED   %s %s  → %d candles  (initial fetch)",
-                        symbol, label, len(new_df))
-            return new_df
+            logger.info("  UP-TO-DATE  %s %s  (%d candles, nothing new)",
+                        symbol, label, len(existing))
+        return combined
 
     def load(self, symbol: str, timeframe_min: str) -> Optional[pd.DataFrame]:
         """Load a saved CSV; returns None if it doesn't exist yet."""
@@ -195,33 +216,93 @@ class DataCollector:
     def _filepath(self, symbol: str, label: str) -> str:
         return os.path.join(self.data_dir, f"{symbol}_{label}.csv")
 
-    def _fetch_history(self, symbol: str, timeframe_min: str) -> List[List]:
+    def _fetch_history_paginated(self, symbol: str, timeframe_min: str,
+                                  days: int) -> List[List]:
         """
-        Fetch the maximum available candle history from Weex in a single request.
+        Fetch `days` worth of historical candles by paginating backwards
+        from now using the endTime parameter.
 
-        Weex's klines endpoint does not support endTime/startTime pagination —
-        passing those parameters returns a 400 error.  Instead we request the
-        largest batch the API will accept, trying progressively smaller limits
-        until one succeeds.  This gives us the most recent N candles available.
+        Makes up to (days × minutes_per_day / tf_min / BATCH_SIZE) + 2 requests,
+        each fetching BATCH_SIZE candles ending at the current cursor.
 
-        Returns a list of candle rows in chronological order.
+        Returns all candles combined in chronological order (oldest first).
         """
-        api_symbol = symbol.replace("_SPBL", "")
+        tf_min           = int(timeframe_min)
+        tf_ms            = tf_min * 60 * 1000          # one candle width in ms
+        target_start_ms  = int((time.time() - days * 86400) * 1000)
+        end_time_ms      = int(time.time() * 1000)
 
-        # Try largest limits first — stop at the first successful response
-        for limit in [1000, 500, 300]:
-            batch = self.client.get_candles(
-                symbol      = api_symbol,
-                granularity = timeframe_min,
-                limit       = limit,
-                # No end_time — Weex rejects it with 400
-            )
-            if batch:
-                logger.info("    … fetched %d candles for %s %s (limit=%d)",
-                            len(batch), symbol, timeframe_min, limit)
-                return batch
+        total_needed = (days * 24 * 60) // tf_min
+        max_batches  = (total_needed // BATCH_SIZE) + 3   # small safety margin
+
+        all_candles: List[List] = []
+        label = TF_LABELS.get(timeframe_min, timeframe_min + "m")
+
+        for batch_num in range(max_batches):
+            try:
+                batch = self.client.get_candles(
+                    symbol      = symbol,
+                    granularity = timeframe_min,
+                    limit       = BATCH_SIZE,
+                    end_time    = end_time_ms,
+                )
+            except Exception as exc:
+                logger.warning("Pagination error batch %d for %s %s: %s",
+                               batch_num + 1, symbol, label, exc)
+                break
+
+            if not batch:
+                # API returned nothing — either we've hit the exchange's
+                # history limit or endTime pagination isn't supported.
+                # Fall back to the single-batch fetch.
+                if not all_candles:
+                    logger.warning(
+                        "  endTime pagination returned nothing for %s %s "
+                        "— falling back to latest-batch fetch.", symbol, label)
+                    return self._fetch_latest(symbol, timeframe_min)
+                break
+
+            # Prepend this (older) batch to what we already have
+            all_candles = batch + all_candles
+
+            oldest_ts = int(float(batch[0][0]))   # batch[0] = oldest after reversal
+
+            if batch_num == 0 or (batch_num + 1) % 10 == 0:
+                oldest_dt = pd.Timestamp(oldest_ts, unit="ms")
+                logger.info("  … batch %d  oldest candle: %s  (%d collected so far)",
+                            batch_num + 1, oldest_dt.strftime("%Y-%m-%d"), len(all_candles))
+
+            if oldest_ts <= target_start_ms:
+                break   # we've gone back far enough
+
+            # Step cursor back to just before the oldest candle we have
+            end_time_ms = oldest_ts - tf_ms
             time.sleep(REQUEST_DELAY)
 
+        # Trim anything older than our target window
+        all_candles = [c for c in all_candles
+                       if int(float(c[0])) >= target_start_ms]
+
+        logger.info("  … pagination complete: %d candles collected for %s %s",
+                    len(all_candles), symbol, label)
+        return all_candles
+
+    def _fetch_latest(self, symbol: str, timeframe_min: str) -> List[List]:
+        """
+        Fetch the most recent batch of candles (no endTime — used for
+        appending new candles to an existing CSV).
+
+        Tries progressively smaller limits until one succeeds.
+        """
+        for limit in [BATCH_SIZE, 500, 300]:
+            batch = self.client.get_candles(
+                symbol      = symbol,
+                granularity = timeframe_min,
+                limit       = limit,
+            )
+            if batch:
+                return batch
+            time.sleep(REQUEST_DELAY)
         return []
 
     def _to_dataframe(self, raw: List[List]) -> pd.DataFrame:
