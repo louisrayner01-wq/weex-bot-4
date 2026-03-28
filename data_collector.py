@@ -79,27 +79,36 @@ class DataCollector:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def collect_all(self) -> None:
+    def collect_all(self, quiet: bool = False) -> None:
         """
         Collect (or refresh) historical data for every symbol × timeframe
         combination.  Skips any file that is still fresh.
+
+        quiet=True suppresses the header/progress lines — used for the
+        background accumulation calls that run every 5 minutes so they
+        don't flood the logs.  Appends and errors still log at INFO/ERROR.
         """
         total = len(SYMBOLS) * len(TIMEFRAMES)
         done  = 0
-        logger.info("═══ Data collection starting — %d symbol/timeframe combos ═══", total)
+
+        if not quiet:
+            logger.info("═══ Data collection starting — %d symbol/timeframe combos ═══", total)
 
         for symbol in SYMBOLS:
             for tf in TIMEFRAMES:
                 try:
-                    self.collect_one(symbol, tf)
+                    self.collect_one(symbol, tf, quiet=quiet)
                 except Exception as exc:
                     logger.error("Failed collecting %s %s: %s", symbol, TF_LABELS[tf], exc)
                 done += 1
-                logger.info("Progress: %d / %d", done, total)
+                if not quiet:
+                    logger.info("Progress: %d / %d", done, total)
 
-        logger.info("═══ Data collection complete ═══")
+        if not quiet:
+            logger.info("═══ Data collection complete ═══")
 
-    def collect_one(self, symbol: str, timeframe_min: str) -> Optional[pd.DataFrame]:
+    def collect_one(self, symbol: str, timeframe_min: str,
+                    quiet: bool = False) -> Optional[pd.DataFrame]:
         """
         Fetch and APPEND new candles for one symbol/timeframe.
 
@@ -133,10 +142,12 @@ class DataCollector:
         # ── Freshness check ───────────────────────────────────────────────────
         if existing is not None and not existing.empty:
             last_ts    = existing["timestamp"].max()
-            age_min    = (pd.Timestamp.utcnow().tz_localize(None) - last_ts).total_seconds() / 60
+            now_utc    = pd.Timestamp.now('UTC').tz_localize(None)
+            age_min    = (now_utc - last_ts).total_seconds() / 60
             if age_min < refresh_min:
-                logger.info("  FRESH   %s %s  — last candle %.0f min ago (refresh at %d min)",
-                            symbol, label, age_min, refresh_min)
+                log = logger.debug if quiet else logger.info
+                log("  FRESH   %s %s  — last candle %.0f min ago (refresh at %d min)",
+                    symbol, label, age_min, refresh_min)
                 return existing
 
         # ── Fetch latest batch ────────────────────────────────────────────────
@@ -249,4 +260,5 @@ if __name__ == "__main__":
     data_dir = cfg.get("data", {}).get("data_dir", "/data")
     collector = DataCollector(client, data_dir=data_dir)
     collector.collect_all()
+
 
