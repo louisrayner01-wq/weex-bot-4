@@ -74,6 +74,10 @@ def load_config(path: str = "config.yaml") -> dict:
     if os.getenv("RISK_PER_TRADE"):
         cfg["risk"]["risk_per_trade_abs"] = float(os.getenv("RISK_PER_TRADE"))
 
+    # FORCE_RETRAIN=true  — wipe saved models and retrain from scratch on next startup.
+    # Remove the variable once models are generating healthy signals.
+    # (Consumed in startup(), not stored in cfg — just documented here.)
+
     return cfg
 
 
@@ -326,6 +330,28 @@ class TradingBot:
         # ── Step 3: Apply recommendations + train ─────────────────────────────
         self.log.info("STEP 3/3  Initial model training")
         try:
+            # ── FORCE_RETRAIN: wipe stale models so the bot retrains from scratch ──
+            # Set env var FORCE_RETRAIN=true on Railway to trigger a clean retrain.
+            # Remove the env var once you've confirmed the models are generating signals.
+            if os.getenv("FORCE_RETRAIN", "false").lower() == "true":
+                self.log.info("♻️  FORCE_RETRAIN=true — clearing saved models for clean retrain")
+                models_dir = self.cfg["logging"]["models_dir"]
+                deleted = 0
+                if os.path.isdir(models_dir):
+                    for fname in os.listdir(models_dir):
+                        if fname.endswith(".joblib"):
+                            try:
+                                os.remove(os.path.join(models_dir, fname))
+                                deleted += 1
+                            except Exception as e:
+                                self.log.warning("Could not delete %s: %s", fname, e)
+                # Reset in-memory state so _initial_train starts clean
+                self.strategy.model = None
+                self.strategy.symbol_models.clear()
+                self.strategy.symbol_scalers.clear()
+                self.strategy.symbol_features.clear()
+                self.log.info("♻️  Deleted %d model file(s) — will train fresh on historical data", deleted)
+
             # Reload analysis so strategy picks up fresh recommendations
             self.strategy.reload_analysis()
             self._apply_analysis_recommendations()
@@ -970,6 +996,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
 
 
