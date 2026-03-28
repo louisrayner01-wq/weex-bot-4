@@ -119,7 +119,10 @@ class DataCollector:
                 try:
                     self.collect_one(symbol, tf, quiet=quiet)
                 except Exception as exc:
-                    logger.error("Failed collecting %s %s: %s", symbol, TF_LABELS[tf], exc)
+                    # 5m is monitoring-only — degrade quietly if unavailable
+                    level = logging.WARNING if tf == "5" else logging.ERROR
+                    logger.log(level, "Failed collecting %s %s: %s",
+                               symbol, TF_LABELS[tf], exc)
                 done += 1
                 if not quiet:
                     logger.info("Progress: %d / %d", done, total)
@@ -152,7 +155,43 @@ class DataCollector:
                 logger.warning("Could not load %s: %s — will re-fetch.", filepath, exc)
                 existing = None
 
-        # ── Freshness check (only skip if CSV already has data) ───────────────
+        days = INITIAL_FETCH_DAYS.get(timeframe_min, 730)
+
+        # ── Thin-data check: backfill even when CSV exists but is too short ───
+        # If the oldest candle in the CSV is more than 30 days newer than our
+        # 2-year target, the data is too thin for good model training.
+        # We backfill by paginating backwards and merging with the existing CSV.
+        if existing is not None and not existing.empty:
+            target_start = (pd.Timestamp.now('UTC').tz_localize(None)
+                            - pd.Timedelta(days=days))
+            oldest_candle = existing["timestamp"].min()
+            gap_days = (oldest_candle - target_start).total_seconds() / 86400
+            if gap_days > 30:
+                logger.info(
+                    "  THIN  %s %s — oldest candle %s, target %s (%d days short) — backfilling…",
+                    symbol, label,
+                    oldest_candle.strftime("%Y-%m-%d"),
+                    target_start.strftime("%Y-%m-%d"),
+                    int(gap_days),
+                )
+                raw = self._fetch_history_paginated(symbol, timeframe_min, days)
+                if raw:
+                    old_df   = self._to_dataframe(raw)
+                    combined = pd.concat([old_df, existing], ignore_index=True)
+                    combined = (combined
+                                .drop_duplicates("timestamp")
+                                .sort_values("timestamp")
+                                .reset_index(drop=True))
+                    combined.to_csv(filepath, index=False)
+                    n_added = len(combined) - len(existing)
+                    logger.info("  BACKFILL  %s %s  +%d candles → %d total  (%d days)",
+                                symbol, label, n_added, len(combined), days)
+                    return combined
+                else:
+                    logger.warning("  Backfill returned no data for %s %s — keeping existing %d candles",
+                                   symbol, label, len(existing))
+
+        # ── Freshness check: skip if last candle is recent enough ─────────────
         if existing is not None and not existing.empty:
             last_ts  = existing["timestamp"].max()
             now_utc  = pd.Timestamp.now('UTC').tz_localize(None)
@@ -165,7 +204,6 @@ class DataCollector:
 
         # ── First run: paginate backwards to collect full history ─────────────
         if existing is None or existing.empty:
-            days = INITIAL_FETCH_DAYS.get(timeframe_min, 730)
             logger.info("  BACKFILL  %s %s  — fetching %d days of history…",
                         symbol, label, days)
             raw = self._fetch_history_paginated(symbol, timeframe_min, days)
