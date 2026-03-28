@@ -170,6 +170,11 @@ class TradingBot:
         self.ltf_tf     = str(tc_cfg.get("ltf_reversal_tf", "60"))
         self.ltf_label  = TF_LABELS.get(self.ltf_tf, "1h")
 
+        # Per-symbol signal TF and HTF — populated by _apply_analysis_recommendations()
+        # Falls back to self.tf / self.htf_tf when not set for a given symbol.
+        self.symbol_tf:  Dict[str, str] = {}   # symbol → signal TF (minutes string)
+        self.symbol_htf: Dict[str, str] = {}   # symbol → HTF (minutes string)
+
         mode = "🟡 PAPER" if self.paper else "🔴 LIVE"
         self.log.info("%s MODE  |  Account: £%.2f  |  Risk/trade: £%.2f  |  Lev: dynamic (max %dx)",
                       mode,
@@ -213,6 +218,18 @@ class TradingBot:
             return self.client.get_balance().get("USDT", self.risk.equity)
         except Exception:
             return self.risk.equity
+
+    def _sym_tf(self, symbol: str) -> str:
+        """Signal TF (minutes string) for this symbol, e.g. '15' or '240'."""
+        return self.symbol_tf.get(symbol, self.tf)
+
+    def _sym_htf(self, symbol: str) -> str:
+        """HTF (minutes string) for this symbol."""
+        return self.symbol_htf.get(symbol, self.htf_tf)
+
+    def _sym_tf_label(self, symbol: str) -> str:
+        """Human-readable TF label for this symbol, e.g. '15m' or '4h'."""
+        return TF_LABELS.get(self._sym_tf(symbol), self.tf)
 
     # ── Order execution ───────────────────────────────────────────────────────
 
@@ -325,6 +342,29 @@ class TradingBot:
                 self.htf_label = best_filter
                 self.log.info("📊 Analysis recommends HTF filter: %s", best_filter)
 
+        # ── Per-symbol signal TF (the main Option-1 change) ──────────────────
+        # analysis.py emits {"BTCUSDT": "4h", "ETHUSDT": "15m", "SOLUSDT": "4h"}
+        per_sym = recs.get("per_symbol_best_tf", {})
+        if per_sym:
+            for pair_cfg in self.pairs:
+                sym      = pair_cfg["symbol"]                              # "ETHUSDT_SPBL"
+                base     = sym.replace("_SPBL", "").replace("_UMCBL", "") # "ETHUSDT"
+                tf_label = per_sym.get(base)                               # "15m"
+                if tf_label:
+                    min_tf = rev_map.get(tf_label)
+                    if min_tf:
+                        htf_min = HTF_UP.get(min_tf, "1440")
+                        self.symbol_tf[sym]  = min_tf
+                        self.symbol_htf[sym] = htf_min
+
+            # Log the full per-symbol TF assignment table
+            assignments = {
+                p["name"]: f"{TF_LABELS.get(self.symbol_tf.get(p['symbol'], self.tf), '?')}"
+                           f" (HTF: {TF_LABELS.get(self.symbol_htf.get(p['symbol'], self.htf_tf), '?')})"
+                for p in self.pairs
+            }
+            self.log.info("📊 Per-symbol TF assignments: %s", assignments)
+
         # Log top features so they're visible in logs
         top_feats = recs.get("top_features", [])[:5]
         if top_feats:
@@ -332,30 +372,31 @@ class TradingBot:
 
     def _initial_train(self):
         """
-        Train the model on the full historical dataset for the primary pair.
-        Uses the SIGNAL timeframe CSV (not the HTF CSV) so the model learns
-        the same candle patterns it will predict on during ticking.
-        Falls back to live candles if no CSV exists.
+        Train a separate model per pair, each on its own optimal signal timeframe.
+        Uses historical CSV data where available, falls back to live candles.
         """
-        primary   = self.pairs[0]["symbol"]
-        sig_label = TF_LABELS.get(self.tf, "4h")   # e.g. "240" → "4h"
-        self.log.info("⏳ Training model on historical data for %s [%s]…", primary, sig_label)
+        for pair_cfg in self.pairs:
+            symbol    = pair_cfg["symbol"]
+            name      = pair_cfg["name"]
+            sig_label = self._sym_tf_label(symbol)   # e.g. "15m" for ETH, "4h" for BTC
 
-        # Try loading the signal-TF historical CSV first
-        hist = self.strategy.load_historical_candles(primary, sig_label)
-        if hist is not None and len(hist) >= self.strategy.min_samples:
-            self.strategy.train(hist, symbol=primary, timeframe_label=sig_label)
-            self.log.info("✅ Model trained on %d historical candles [%s].", len(hist), sig_label)
-        else:
-            # Fallback: fetch live candles at the signal TF
-            df = self.fetch_candles(primary)
-            if df is not None and len(df) >= self.strategy.min_samples:
-                self.strategy.train(df, symbol=primary, timeframe_label=sig_label)
-                self.log.info("✅ Model trained on %d live candles (historical CSV not ready).",
-                              len(df))
+            self.log.info("⏳ Training model for %s [%s]…", name, sig_label)
+
+            hist = self.strategy.load_historical_candles(symbol, sig_label)
+            if hist is not None and len(hist) >= self.strategy.min_samples:
+                self.strategy.train(hist, symbol=symbol, timeframe_label=sig_label)
+                self.log.info("✅ %s model trained on %d historical candles [%s].",
+                              name, len(hist), sig_label)
             else:
-                n = len(df) if df is not None else 0
-                self.log.info("⚠️  Only %d candles available — model will train once data builds up.", n)
+                # Fallback: fetch live candles at this symbol's signal TF
+                df = self.fetch_candles(symbol, tf=self._sym_tf(symbol))
+                if df is not None and len(df) >= self.strategy.min_samples:
+                    self.strategy.train(df, symbol=symbol, timeframe_label=sig_label)
+                    self.log.info("✅ %s model trained on %d live candles (CSV not ready).",
+                                  name, len(df))
+                else:
+                    n = len(df) if df is not None else 0
+                    self.log.info("⚠️  %s: only %d candles — will train once data builds up.", name, n)
 
     # ── LTF reversal detector ─────────────────────────────────────────────────
 
@@ -407,7 +448,7 @@ class TradingBot:
         Called from both tick() (4h) and scan_entries() (15 min).
         Returns True if a position was opened.
         """
-        signal, buy_p, sell_p = self.strategy.predict(df)
+        signal, buy_p, sell_p = self.strategy.predict(df, symbol=symbol)
         signal, buy_p, sell_p = self.strategy.apply_confluence(
             signal, buy_p, sell_p, htf_direction
         )
@@ -430,6 +471,9 @@ class TradingBot:
 
         qty, leverage = self.risk.calc_position(price, atr, win_rate)
 
+        # Use per-symbol HTF label for the trade card
+        htf_lbl = TF_LABELS.get(self._sym_htf(symbol), self.htf_label)
+
         verdict = rr_ok and ev_ok and signal != HOLD
         print_trade_card(
             pair=symbol, signal=signal, confidence=confidence,
@@ -437,7 +481,7 @@ class TradingBot:
             actual_rr=actual_rr, qty=qty,
             risk_amount=self.risk.risk_per_trade_abs,
             ev_reason=ev_reason, verdict=verdict,
-            htf_label=self.htf_label, htf_direction=htf_direction,
+            htf_label=htf_lbl, htf_direction=htf_direction,
         )
 
         if not rr_ok:
@@ -533,7 +577,7 @@ class TradingBot:
                     if full_df is not None:
                         self.strategy.record_outcome(
                             trade, full_df, symbol=symbol,
-                            timeframe_label=TF_LABELS.get(self.tf, "4h"),
+                            timeframe_label=self._sym_tf_label(symbol),
                         )
                 continue
 
@@ -551,7 +595,7 @@ class TradingBot:
                         if full_df is not None:
                             self.strategy.record_outcome(
                                 trade, full_df, symbol=symbol,
-                                timeframe_label=TF_LABELS.get(self.tf, "4h"),
+                                timeframe_label=self._sym_tf_label(symbol),
                             )
 
     # ── Background data accumulation ─────────────────────────────────────────
@@ -568,7 +612,30 @@ class TradingBot:
         try:
             self.collector.collect_all(quiet=True)
         except Exception as exc:
-            self.log.debug("Background data accumulation error: %s", exc)
+            # Raised to WARNING so storage errors are visible in Railway logs
+            self.log.warning("Background data accumulation error: %s", exc)
+
+    def log_data_sizes(self):
+        """
+        Print a one-line summary of how many candles are stored per CSV.
+        Called periodically from the run loop so growth is visible in logs.
+        """
+        from data_collector import SYMBOLS, TF_LABELS, TIMEFRAMES
+        parts = []
+        total_kb = 0.0
+        for sym in SYMBOLS:
+            for tf in TIMEFRAMES:
+                label = TF_LABELS[tf]
+                fp = os.path.join(self.data_dir, f"{sym}_{label}.csv")
+                if os.path.exists(fp):
+                    try:
+                        rows = sum(1 for _ in open(fp)) - 1   # subtract header
+                        kb   = os.path.getsize(fp) / 1024
+                        total_kb += kb
+                        parts.append(f"{sym[:3]}/{label}={rows}")
+                    except Exception:
+                        pass
+        self.log.info("📦 Data store  %.1f KB total  |  %s", total_kb, "  ".join(parts))
 
     # ── 15-min entry scan (runs when flat — no open positions) ───────────────
 
@@ -595,7 +662,10 @@ class TradingBot:
             if symbol in self.risk.open_positions:
                 continue
 
-            df = self.fetch_candles(symbol)
+            sym_tf  = self._sym_tf(symbol)
+            sym_htf = self._sym_htf(symbol)
+
+            df = self.fetch_candles(symbol, tf=sym_tf)
             if df is None or len(df) < 60:
                 results.append(f"{name}→NO_DATA")
                 continue
@@ -604,12 +674,12 @@ class TradingBot:
             atr   = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else price * 0.01
 
             htf_df = None
-            if self.htf_tf != self.tf:
-                htf_df = self.fetch_candles(symbol, tf=self.htf_tf, limit=100)
+            if sym_htf != sym_tf:
+                htf_df = self.fetch_candles(symbol, tf=sym_htf, limit=100)
             htf_direction = self.strategy.htf_trend(htf_df) if htf_df is not None else 0
 
             # Peek at probabilities for the summary line
-            signal, buy_p, sell_p = self.strategy.predict(df)
+            signal, buy_p, sell_p = self.strategy.predict(df, symbol=symbol)
             signal, buy_p, sell_p = self.strategy.apply_confluence(
                 signal, buy_p, sell_p, htf_direction
             )
@@ -639,8 +709,9 @@ class TradingBot:
         for pair_cfg in self.pairs:
             symbol = pair_cfg["symbol"]
 
-            # ── 1. Fetch primary-TF candles ───────────────────────────────────
-            df = self.fetch_candles(symbol)
+            # ── 1. Fetch signal-TF candles (per-symbol optimal TF) ───────────
+            sym_tf = self._sym_tf(symbol)
+            df = self.fetch_candles(symbol, tf=sym_tf)
             if df is None or len(df) < 60:
                 continue
 
@@ -648,9 +719,10 @@ class TradingBot:
             atr   = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else price * 0.01
 
             # ── 2. Fetch higher-TF candles for confluence ─────────────────────
+            sym_htf = self._sym_htf(symbol)
             htf_df = None
-            if self.htf_tf != self.tf:
-                htf_df = self.fetch_candles(symbol, tf=self.htf_tf, limit=100)
+            if sym_htf != sym_tf:
+                htf_df = self.fetch_candles(symbol, tf=sym_htf, limit=100)
             htf_direction = self.strategy.htf_trend(htf_df) if htf_df is not None else 0
 
             # ── 3. Skip entry evaluation if already in this position ─────────
@@ -676,7 +748,7 @@ class TradingBot:
     def run(self):
         self.log.info("🚀 Weex Trading Bot  v3  starting…")
         self.log.info("   Pairs      : %s", [p["name"] for p in self.pairs])
-        self.log.info("   Signal TF  : %s min", self.tf)
+        self.log.info("   Signal TF  : %s min (per-symbol TFs applied after analysis)", self.tf)
         self.log.info("   Filter TF  : %s (HTF confluence)", self.htf_label)
         self.log.info("   Leverage   : dynamic — auto-set per trade (max %dx)",
                       self.cfg["risk"].get("max_leverage", 20))
@@ -697,6 +769,7 @@ class TradingBot:
 
         last_scan_time   = 0.0   # force an entry scan almost immediately
         last_signal_time = 0.0   # force a full tick on startup
+        monitor_cycle    = 0     # counts 5-min cycles for periodic reporting
 
         while True:
             try:
@@ -705,6 +778,11 @@ class TradingBot:
                 # 1. Always check SL / TP / TP1 / LTF reversal + accumulate data
                 self.monitor_exits()
                 self.accumulate_data()
+                monitor_cycle += 1
+
+                # Log data store sizes every hour (12 × 5-min cycles)
+                if monitor_cycle % 12 == 0:
+                    self.log_data_sizes()
 
                 # 2. Full 4h tick — retraining, performance summary, entries
                 if now - last_signal_time >= SIGNAL_INTERVAL:
