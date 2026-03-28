@@ -41,6 +41,7 @@ Each timeframe refreshes at its own natural cadence:
 import os
 import time
 import logging
+import requests
 import pandas as pd
 from typing import Optional, List
 
@@ -264,74 +265,84 @@ class DataCollector:
         clean = symbol.replace("_UMCBL", "").replace("_SPBL", "").replace("_DMCBL", "")
         return os.path.join(self.data_dir, f"{clean}_{label}.csv")
 
+    # Binance public klines API — used for historical backfill only.
+    # Weex spot API does not support startTime/endTime pagination, so we use
+    # Binance (free, no auth) to get 2 years of OHLCV training data.
+    # BTC/ETH/SOL spot prices are effectively identical across exchanges.
+    _BINANCE_URL = "https://api.binance.com/api/v3/klines"
+    _BINANCE_INTERVAL_MAP = {
+        "5": "5m", "15": "15m", "60": "1h", "240": "4h", "1440": "1d",
+    }
+
     def _fetch_history_paginated(self, symbol: str, timeframe_min: str,
                                   days: int) -> List[List]:
         """
-        Fetch `days` worth of historical candles by paginating backwards
-        from now using the endTime parameter.
+        Fetch `days` worth of historical candles by paginating FORWARD from
+        (now - days) using Binance's public klines API.
 
-        Makes up to (days × minutes_per_day / tf_min / BATCH_SIZE) + 2 requests,
-        each fetching BATCH_SIZE candles ending at the current cursor.
+        Binance supports startTime/endTime in milliseconds, returns up to 1000
+        candles per request, and provides full multi-year history.
 
         Returns all candles combined in chronological order (oldest first).
         """
-        tf_min           = int(timeframe_min)
-        tf_ms            = tf_min * 60 * 1000          # one candle width in ms
-        target_start_ms  = int((time.time() - days * 86400) * 1000)
-        end_time_ms      = int(time.time() * 1000)
-
-        total_needed = (days * 24 * 60) // tf_min
-        max_batches  = (total_needed // BATCH_SIZE) + 3   # small safety margin
+        tf_min          = int(timeframe_min)
+        tf_ms           = tf_min * 60 * 1000
+        target_start_ms = int((time.time() - days * 86400) * 1000)
+        start_time_ms   = target_start_ms
+        interval        = self._BINANCE_INTERVAL_MAP.get(timeframe_min, "1h")
+        label           = TF_LABELS.get(timeframe_min, timeframe_min + "m")
+        # Plain symbol for Binance (strip any exchange suffix)
+        clean_symbol    = symbol.replace("_UMCBL","").replace("_SPBL","").replace("_DMCBL","")
 
         all_candles: List[List] = []
-        label = TF_LABELS.get(timeframe_min, timeframe_min + "m")
+        batch_num = 0
 
-        for batch_num in range(max_batches):
+        while True:
+            batch_num += 1
             try:
-                batch = self.client.get_candles(
-                    symbol      = symbol,
-                    granularity = timeframe_min,
-                    limit       = BATCH_SIZE,
-                    end_time    = end_time_ms,
+                resp = requests.get(
+                    self._BINANCE_URL,
+                    params={
+                        "symbol":    clean_symbol,
+                        "interval":  interval,
+                        "startTime": start_time_ms,
+                        "limit":     1000,
+                    },
+                    timeout=15,
                 )
+                resp.raise_for_status()
+                raw = resp.json()
             except Exception as exc:
-                logger.warning("Pagination error batch %d for %s %s: %s",
-                               batch_num + 1, symbol, label, exc)
+                logger.warning("  Binance fetch error batch %d for %s %s: %s",
+                               batch_num, symbol, label, exc)
                 break
 
-            if not batch:
-                # API returned nothing — either we've hit the exchange's
-                # history limit or endTime pagination isn't supported.
-                # Fall back to the single-batch fetch.
-                if not all_candles:
-                    logger.warning(
-                        "  endTime pagination returned nothing for %s %s "
-                        "— falling back to latest-batch fetch.", symbol, label)
-                    return self._fetch_latest(symbol, timeframe_min)
-                break
+            if not raw:
+                break  # no more data
 
-            # Prepend this (older) batch to what we already have
-            all_candles = batch + all_candles
+            # Binance format: [openTime, open, high, low, close, volume, ...]
+            candles = [[c[0], c[1], c[2], c[3], c[4], c[5]] for c in raw]
+            all_candles.extend(candles)
 
-            oldest_ts = int(float(batch[0][0]))   # batch[0] = oldest after reversal
+            newest_ts = int(candles[-1][0])
 
-            if batch_num == 0 or (batch_num + 1) % 10 == 0:
-                oldest_dt = pd.Timestamp(oldest_ts, unit="ms")
-                logger.info("  … batch %d  oldest candle: %s  (%d collected so far)",
-                            batch_num + 1, oldest_dt.strftime("%Y-%m-%d"), len(all_candles))
+            if batch_num == 1 or batch_num % 10 == 0:
+                oldest_dt  = pd.Timestamp(int(candles[0][0]),  unit="ms")
+                newest_dt  = pd.Timestamp(newest_ts, unit="ms")
+                logger.info("  … batch %d  %s → %s  (%d collected so far)",
+                            batch_num,
+                            oldest_dt.strftime("%Y-%m-%d"),
+                            newest_dt.strftime("%Y-%m-%d"),
+                            len(all_candles))
 
-            if oldest_ts <= target_start_ms:
-                break   # we've gone back far enough
+            now_ms = int(time.time() * 1000)
+            if newest_ts >= now_ms - tf_ms or len(raw) < 1000:
+                break  # reached present or got a partial batch (end of history)
 
-            # Step cursor back to just before the oldest candle we have
-            end_time_ms = oldest_ts - tf_ms
+            start_time_ms = newest_ts + tf_ms
             time.sleep(REQUEST_DELAY)
 
-        # Trim anything older than our target window
-        all_candles = [c for c in all_candles
-                       if int(float(c[0])) >= target_start_ms]
-
-        logger.info("  … pagination complete: %d candles collected for %s %s",
+        logger.info("  … Binance pagination complete: %d candles for %s %s",
                     len(all_candles), symbol, label)
         return all_candles
 
@@ -389,6 +400,7 @@ if __name__ == "__main__":
     data_dir = cfg.get("data", {}).get("data_dir", "/data")
     collector = DataCollector(client, data_dir=data_dir)
     collector.collect_all()
+
 
 
 
