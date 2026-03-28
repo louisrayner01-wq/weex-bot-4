@@ -257,10 +257,12 @@ class WeexClient:
                 "limit":    limit,
             }
 
+        # Weex klines endpoints accept timestamps in SECONDS, not milliseconds.
+        # Callers pass ms (standard internal unit) so we divide here.
         if start_time is not None:
-            params["startTime"] = start_time
+            params["startTime"] = start_time // 1000
         if end_time is not None:
-            params["endTime"] = end_time
+            params["endTime"] = end_time // 1000
 
         data = self._get(endpoint, params, auth=False)
         raw = data.get("data", [])
@@ -388,6 +390,3 @@ class WeexClient:
         """Quick connectivity check using public ticker endpoint."""
         result = self.get_ticker("BTCUSDT")
         return result is not None
-
-
-
