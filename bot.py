@@ -325,7 +325,7 @@ class TradingBot:
         # ── Step 2: Analysis ──────────────────────────────────────────────────
         self.log.info("STEP 2/3  Strategy analysis")
         try:
-            stale_days = self.cfg.get("strategy", {}).get("analysis_stale_days", 7)
+            stale_days = self.cfg.get("data", {}).get("analysis_stale_days", 7)
             if not self.analyzer.results_are_fresh(max_age_days=stale_days):
                 self.analyzer.run()
             else:
@@ -1002,6 +1002,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
 
 
