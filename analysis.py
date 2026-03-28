@@ -31,6 +31,7 @@ Results are ranked and saved so strategy.py can auto-configure itself.
 
 import os
 import json
+import time
 import logging
 import numpy as np
 import pandas as pd
@@ -48,18 +49,56 @@ from data_collector import TF_LABELS, TIMEFRAMES, SYMBOLS
 
 logger = logging.getLogger(__name__)
 
-RESULTS_FILE = "analysis_results.json"
-MIN_SAMPLES  = 200    # minimum candles needed to analyse a timeframe
+RESULTS_FILE  = "analysis_results.json"
 LABEL_HORIZON = 4     # candles forward for labelling
-LABEL_THRESH  = 0.005 # 0.5 % move = meaningful signal
 BUY, HOLD, SELL = 1, 0, -1
+
+# ── Timeframe-specific thresholds ─────────────────────────────────────────────
+# A "meaningful" price move differs hugely between 5m and 1d candles.
+# Using a single 0.5% threshold causes 5m/15m candles to almost never get
+# labelled BUY or SELL — leaving too few samples to train on.
+#
+# These values are calibrated so roughly 30–40% of candles receive a
+# directional label (BUY or SELL) at each timeframe.
+TF_LABEL_THRESH: Dict[str, float] = {
+    "5m":   0.003,   # 0.3 % — 5 candles × 5 min  ≈ 25 min lookahead
+    "15m":  0.005,   # 0.5 % — 4 candles × 15 min ≈ 1 h  lookahead
+    "1h":   0.008,   # 0.8 % — 4 candles × 1 h    ≈ 4 h  lookahead
+    "4h":   0.015,   # 1.5 % — 4 candles × 4 h    ≈ 16 h lookahead
+    "1d":   0.020,   # 2.0 % — 4 candles × 1 d    ≈ 4 d  lookahead
+}
+
+# Minimum number of labelled (BUY + SELL) rows needed after feature engineering.
+# Lower for short TFs because we accumulate candles faster and the model
+# still generalises well at lower sample counts.
+TF_MIN_SAMPLES: Dict[str, int] = {
+    "5m":   30,
+    "15m":  50,
+    "1h":   80,
+    "4h":  120,
+    "1d":  150,
+}
+
+# Minimum raw candle rows needed before we even try to load a CSV for analysis.
+TF_MIN_CANDLES: Dict[str, int] = {
+    "5m":   60,
+    "15m":  80,
+    "1h":  100,
+    "4h":  100,
+    "1d":  100,
+}
+
+# Fallback defaults for any unlisted label
+_DEFAULT_THRESH      = 0.010
+_DEFAULT_MIN_SAMPLES = 100
+_DEFAULT_MIN_CANDLES = 100
 
 
 # ── Labelling ─────────────────────────────────────────────────────────────────
 
 def label_candles(df: pd.DataFrame,
                   horizon: int   = LABEL_HORIZON,
-                  threshold: float = LABEL_THRESH) -> pd.Series:
+                  threshold: float = _DEFAULT_THRESH) -> pd.Series:
     future_ret = df["close"].pct_change(horizon).shift(-horizon)
     labels = pd.Series(HOLD, index=df.index)
     labels[future_ret >  threshold] = BUY
@@ -76,8 +115,12 @@ def analyse_timeframe(df: pd.DataFrame,
     Train and cross-validate a Random Forest on one timeframe.
     Returns a dict of metrics, or None if data is insufficient.
     """
+    # Pick TF-specific threshold and minimum sample count
+    thresh      = TF_LABEL_THRESH.get(tf_label, _DEFAULT_THRESH)
+    min_samples = TF_MIN_SAMPLES.get(tf_label, _DEFAULT_MIN_SAMPLES)
+
     df = compute_features(df.copy())
-    labels = label_candles(df)
+    labels = label_candles(df, threshold=thresh)
 
     available = [c for c in FEATURE_COLS if c in df.columns]
     df_feat = df[available].copy()
@@ -87,9 +130,11 @@ def analyse_timeframe(df: pd.DataFrame,
     df_feat = df_feat.dropna()
     df_feat = df_feat[df_feat["label"] != HOLD]   # binary: BUY vs SELL only
 
-    if len(df_feat) < MIN_SAMPLES:
-        logger.warning("  Skipping %s %s — only %d labelled samples",
-                       symbol, tf_label, len(df_feat))
+    if len(df_feat) < min_samples:
+        logger.warning(
+            "  Skipping %s %s — only %d labelled samples "
+            "(need %d, thresh=%.3f%% — accumulating more data)",
+            symbol, tf_label, len(df_feat), min_samples, thresh * 100)
         return None
 
     X = df_feat[available].values
@@ -136,9 +181,9 @@ def analyse_timeframe(df: pd.DataFrame,
                                       key=lambda x: x[1], reverse=True)},
         "top_features": top_features,
     }
-    logger.info("  %s %s  |  acc=%.3f±%.3f  |  samples=%d  |  top=%s",
+    logger.info("  %s %s  |  acc=%.3f±%.3f  |  samples=%d (thresh=%.1f%%)  |  top=%s",
                 symbol, tf_label, accuracy, np.std(cv_scores),
-                len(df_feat), top_features[:3])
+                len(df_feat), thresh * 100, top_features[:3])
     return result
 
 
@@ -180,8 +225,11 @@ def analyse_confluence(signal_df: pd.DataFrame,
     Compare win rate on signal_tf with and without a filter_tf trend gate.
     Returns metrics dict.
     """
+    thresh      = TF_LABEL_THRESH.get(signal_tf, _DEFAULT_THRESH)
+    min_samples = TF_MIN_SAMPLES.get(signal_tf, _DEFAULT_MIN_SAMPLES)
+
     signal_df = compute_features(signal_df.copy())
-    signal_labels = label_candles(signal_df)
+    signal_labels = label_candles(signal_df, threshold=thresh)
     signal_df["label"] = signal_labels
 
     # Get higher-TF trend direction indexed by timestamp
@@ -200,7 +248,7 @@ def analyse_confluence(signal_df: pd.DataFrame,
     combined = combined.reset_index().dropna(subset=["label", "htf_trend"])
     combined = combined[combined["label"] != HOLD]
 
-    if len(combined) < MIN_SAMPLES:
+    if len(combined) < min_samples:
         return None
 
     # Baseline: all signals regardless of HTF trend
@@ -295,8 +343,7 @@ class Analyzer:
         Run the full analysis pipeline and save results.
         Returns the results dict.
         """
-        import time as _time
-        t0 = _time.time()
+        t0 = time.time()
         logger.info("═══ Analysis pipeline starting ═══")
 
         tf_results:    List[Dict] = []
@@ -310,14 +357,15 @@ class Analyzer:
             for tf in TIMEFRAMES:
                 label = TF_LABELS[tf]
                 fp = os.path.join(self.data_dir, f"{symbol}_{label}.csv")
+                min_candles = TF_MIN_CANDLES.get(label, _DEFAULT_MIN_CANDLES)
                 if os.path.exists(fp):
                     df = pd.read_csv(fp, parse_dates=["timestamp"])
-                    if len(df) >= MIN_SAMPLES:
+                    if len(df) >= min_candles:
                         tf_data[tf] = df
                         logger.info("  Loaded %s %s — %d candles", symbol, label, len(df))
                     else:
-                        logger.warning("  Skipping %s %s — insufficient data (%d rows)",
-                                       symbol, label, len(df))
+                        logger.warning("  Skipping %s %s — insufficient data (%d rows, need %d)",
+                                       symbol, label, len(df), min_candles)
                 else:
                     logger.warning("  No CSV found for %s %s", symbol, label)
 
@@ -355,7 +403,7 @@ class Analyzer:
 
         results = {
             "generated_at":      datetime.utcnow().isoformat() + "Z",
-            "duration_seconds":  round(_time.time() - t0, 1),
+            "duration_seconds":  round(time.time() - t0, 1),
             "timeframe_results": tf_results,
             "confluence_results": conf_results,
             "recommendations":   recommendations,
@@ -504,3 +552,4 @@ if __name__ == "__main__":
     data_dir = cfg.get("data", {}).get("data_dir", "/data")
     analyzer = Analyzer(data_dir=data_dir, results_dir=data_dir)
     analyzer.run()
+
