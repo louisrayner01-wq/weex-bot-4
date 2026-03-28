@@ -60,7 +60,10 @@ TF_LABELS = {
     "1440": "1d",
 }
 
-SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+# Use the futures (UMCBL) symbol format so candle data comes from the futures
+# market endpoint — correct data source for a futures trading bot.
+# CSV filenames still use the plain form (BTCUSDT_4h.csv) via _filepath().
+SYMBOLS: List[str] = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL"]
 
 REQUEST_DELAY = 0.5   # seconds between requests (rate-limit safety)
 
@@ -84,7 +87,9 @@ INITIAL_FETCH_DAYS = {
     "1440": 730,   # ~730 candles in 1 batch
 }
 
-BATCH_SIZE = 1000   # candles per API request
+# Futures API caps at 200 candles per request (spot allowed 1000).
+# The paginator will make more round-trips but still collects the full history.
+BATCH_SIZE = 200
 
 
 # ── Core collector ────────────────────────────────────────────────────────────
@@ -252,7 +257,9 @@ class DataCollector:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _filepath(self, symbol: str, label: str) -> str:
-        return os.path.join(self.data_dir, f"{symbol}_{label}.csv")
+        # Strip exchange suffix so filenames stay clean: BTCUSDT_4h.csv
+        clean = symbol.replace("_UMCBL", "").replace("_SPBL", "").replace("_DMCBL", "")
+        return os.path.join(self.data_dir, f"{clean}_{label}.csv")
 
     def _fetch_history_paginated(self, symbol: str, timeframe_min: str,
                                   days: int) -> List[List]:
@@ -332,7 +339,7 @@ class DataCollector:
 
         Tries progressively smaller limits until one succeeds.
         """
-        for limit in [BATCH_SIZE, 500, 300]:
+        for limit in [BATCH_SIZE, 100, 50]:
             batch = self.client.get_candles(
                 symbol      = symbol,
                 granularity = timeframe_min,
