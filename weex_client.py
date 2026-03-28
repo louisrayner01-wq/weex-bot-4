@@ -36,16 +36,20 @@ ENDPOINTS = {
     "open_orders":   "/api/v2/trade/unfilled-orders",
 }
 
-# ── Weex Futures (UMCBL) API endpoints ────────────────────────────────────────
+# ── Weex Contract (Futures/Perpetuals) API ────────────────────────────────────
+# Contract API lives on a separate domain and uses /capi/v3/ paths.
+# Symbol format: plain BTCUSDT (no _UMCBL suffix), same as spot.
+CONTRACT_BASE_URL = "https://api-contract.weex.com"
+
 FUTURES_ENDPOINTS = {
-    "place_order":   "/api/mix/v1/order/placeOrder",
-    "cancel_order":  "/api/mix/v1/order/cancel-order",
-    "set_leverage":  "/api/mix/v1/account/setLeverage",
-    "account":       "/api/mix/v1/account/account",
-    "position":      "/api/mix/v1/position/singlePosition",
-    "open_orders":   "/api/mix/v1/order/current",
-    # Futures OHLCV candles — uses full _UMCBL symbol and granularity param
-    "candles":       "/api/mix/v1/market/candles",
+    "place_order":   "/capi/v3/order",
+    "cancel_order":  "/capi/v3/order/cancel",
+    "set_leverage":  "/capi/v3/account/setLeverage",
+    "account":       "/capi/v3/account",
+    "position":      "/capi/v3/position/getPositions",
+    "open_orders":   "/capi/v3/order/current",
+    # Contract OHLCV candles — plain symbol, interval param, same format as spot
+    "candles":       "/capi/v3/market/klines",
 }
 
 # Map our minute-based timeframe config values → Weex spot interval strings
@@ -63,20 +67,20 @@ INTERVAL_MAP = {
     "1440": "1d",
 }
 
-# Map our minute-based timeframe config values → Weex futures granularity strings
-# Futures API uses different format from spot: "1min", "1H", "1D" etc.
+# Map our minute-based timeframe config values → Weex contract interval strings
+# Contract API (/capi/v3/) uses the same interval format as spot (/api/v3/).
 FUTURES_INTERVAL_MAP = {
-    "1":    "1min",
-    "3":    "3min",
-    "5":    "5min",
-    "15":   "15min",
-    "30":   "30min",
-    "60":   "1H",
-    "120":  "2H",
-    "240":  "4H",
-    "360":  "6H",
-    "720":  "12H",
-    "1440": "1D",
+    "1":    "1m",
+    "3":    "3m",
+    "5":    "5m",
+    "15":   "15m",
+    "30":   "30m",
+    "60":   "1h",
+    "120":  "2h",
+    "240":  "4h",
+    "360":  "6h",
+    "720":  "12h",
+    "1440": "1d",
 }
 
 # Weex futures candles API returns at most 200 candles per request
@@ -137,10 +141,15 @@ class WeexClient:
         if params:
             qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
-        # Build list of base URLs to try: configured domain first, then fallbacks
-        candidates = [self.base_url] + [
-            d for d in self._FALLBACK_DOMAINS if d != self.base_url
-        ]
+        # /capi/ paths belong to the contract API domain — route there directly.
+        # All other paths (spot /api/v2/, /api/v3/) use the configured base URL.
+        if path.startswith("/capi/"):
+            candidates = [CONTRACT_BASE_URL]
+        else:
+            # Build list of base URLs to try: configured domain first, then fallbacks
+            candidates = [self.base_url] + [
+                d for d in self._FALLBACK_DOMAINS if d != self.base_url
+            ]
 
         last_exc: Optional[Exception] = None
         for base in candidates:
@@ -175,8 +184,9 @@ class WeexClient:
     def _post(self, path: str, payload: Dict, auth: bool = True) -> Dict:
         body = json.dumps(payload, separators=(",", ":"))
         headers = self._auth_headers("POST", path, body) if auth else {}
+        base = CONTRACT_BASE_URL if path.startswith("/capi/") else self.base_url
         try:
-            resp = self.session.post(self.base_url + path, headers=headers, data=body, timeout=10)
+            resp = self.session.post(base + path, headers=headers, data=body, timeout=10)
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") not in (None, "0", 0, "00000"):
@@ -220,21 +230,23 @@ class WeexClient:
             chronological order.
 
         Routes automatically:
-          _UMCBL symbols → futures endpoint (/api/mix/v1/market/candles),
-                           granularity param, max 200 candles per call.
-          plain symbols  → spot endpoint (/api/v3/market/klines),
+          _UMCBL symbols → contract endpoint (api-contract.weex.com/capi/v3/market/klines),
+                           plain symbol (no suffix), interval param, max 200 candles per call.
+          plain symbols  → spot endpoint (api-spot.weex.com/api/v3/market/klines),
                            interval param, up to 1000 candles per call.
         """
         is_futures = "_UMCBL" in symbol or "_DMCBL" in symbol
 
         if is_futures:
-            interval  = FUTURES_INTERVAL_MAP.get(str(granularity), "1H")
+            # Contract API uses plain symbol (no _UMCBL suffix) and interval param —
+            # same format as spot.  Routes to api-contract.weex.com via _get().
+            interval  = FUTURES_INTERVAL_MAP.get(str(granularity), "1h")
             endpoint  = FUTURES_ENDPOINTS["candles"]
             limit     = min(limit, FUTURES_CANDLE_LIMIT)
             params: Dict[str, Any] = {
-                "symbol":      symbol,    # keep full _UMCBL suffix
-                "granularity": interval,
-                "limit":       limit,
+                "symbol":   _market_symbol(symbol),   # strip _UMCBL
+                "interval": interval,
+                "limit":    limit,
             }
         else:
             interval  = INTERVAL_MAP.get(str(granularity), "1h")
@@ -376,5 +388,6 @@ class WeexClient:
         """Quick connectivity check using public ticker endpoint."""
         result = self.get_ticker("BTCUSDT")
         return result is not None
+
 
 
