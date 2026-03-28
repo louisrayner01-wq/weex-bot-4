@@ -137,7 +137,7 @@ def print_trade_card(pair: str, signal: int, confidence: float,
         ev_str,
         actual_rr,
         htf_str or "N/A (no HTF data)",
-        qty, pair.replace("USDT_SPBL", ""), risk_amount,
+        qty, pair.replace("USDT_UMCBL", "").replace("USDT_SPBL", ""), risk_amount,
         ev_reason[:44],
         verdict_str,
         border,
@@ -175,7 +175,7 @@ class TradingBot:
         self.symbol_tf:  Dict[str, str] = {}   # symbol → signal TF (minutes string)
         self.symbol_htf: Dict[str, str] = {}   # symbol → HTF (minutes string)
 
-        mode = "🟡 PAPER" if self.paper else "🔴 LIVE"
+        mode = "🟡 PAPER FUTURES" if self.paper else "🔴 LIVE FUTURES"
         self.log.info("%s MODE  |  Account: £%.2f  |  Risk/trade: £%.2f  |  Lev: dynamic (max %dx)",
                       mode,
                       self.cfg["risk"]["initial_capital"],
@@ -215,7 +215,7 @@ class TradingBot:
         if self.paper:
             return self.risk.equity
         try:
-            return self.client.get_balance().get("USDT", self.risk.equity)
+            return self.client.get_futures_balance()
         except Exception:
             return self.risk.equity
 
@@ -231,27 +231,61 @@ class TradingBot:
         """Human-readable TF label for this symbol, e.g. '15m' or '4h'."""
         return TF_LABELS.get(self._sym_tf(symbol), self.tf)
 
-    # ── Order execution ───────────────────────────────────────────────────────
+    # ── Futures order execution ────────────────────────────────────────────────
 
-    def _buy(self, symbol: str, qty: float, price: float) -> Optional[str]:
+    def _futures_order(self, symbol: str, side: str,
+                       qty: float, price: float) -> Optional[str]:
+        """
+        Place a futures market order and return the order ID.
+        side: 'open_long' | 'open_short' | 'close_long' | 'close_short'
+        """
         if self.paper:
-            self.log.info("[PAPER] BUY  %s  qty=%.5f @ £%.4f", symbol, qty, price)
-            return f"paper-buy-{symbol}-{int(time.time())}"
-        resp = self.client.place_order(symbol, "buy", qty)
-        oid  = resp.get("data", {}).get("orderId")
+            self.log.info("[PAPER] %s  %s  qty=%.5f @ £%.4f",
+                          side.upper(), symbol, qty, price)
+            return f"paper-{side}-{symbol}-{int(time.time())}"
+        resp = self.client.futures_order(symbol, side, qty)
+        oid  = (resp.get("data") or {}).get("orderId")
         if not oid:
-            self.log.error("Buy order failed: %s", resp)
+            self.log.error("Futures order failed (%s %s): %s", side, symbol, resp)
         return oid
 
-    def _sell(self, symbol: str, qty: float, price: float) -> Optional[str]:
+    def _open_long(self, s: str, qty: float, p: float) -> Optional[str]:
+        return self._futures_order(s, "open_long",  qty, p)
+
+    def _open_short(self, s: str, qty: float, p: float) -> Optional[str]:
+        return self._futures_order(s, "open_short", qty, p)
+
+    def _close_long(self, s: str, qty: float, p: float) -> Optional[str]:
+        return self._futures_order(s, "close_long",  qty, p)
+
+    def _close_short(self, s: str, qty: float, p: float) -> Optional[str]:
+        return self._futures_order(s, "close_short", qty, p)
+
+    def _close_pos(self, symbol: str, qty: float,
+                   price: float, side: str) -> Optional[str]:
+        """Close any position correctly based on its side."""
+        if side == "long":
+            return self._close_long(symbol, qty, price)
+        return self._close_short(symbol, qty, price)
+
+    def _setup_leverage(self):
+        """
+        Set leverage for every trading pair (both long and short sides).
+        Called once during startup before the trading loop begins.
+        In paper mode this is skipped (no real account to configure).
+        """
         if self.paper:
-            self.log.info("[PAPER] SELL %s  qty=%.5f @ £%.4f", symbol, qty, price)
-            return f"paper-sell-{symbol}-{int(time.time())}"
-        resp = self.client.place_order(symbol, "sell", qty)
-        oid  = resp.get("data", {}).get("orderId")
-        if not oid:
-            self.log.error("Sell order failed: %s", resp)
-        return oid
+            self.log.info("⚙️  [PAPER] Leverage setup skipped (paper trading mode)")
+            return
+        lev = self.cfg["risk"].get("max_leverage", 20)
+        for pair_cfg in self.pairs:
+            symbol = pair_cfg["symbol"]
+            try:
+                self.client.set_leverage(symbol, lev, "long")
+                self.client.set_leverage(symbol, lev, "short")
+                self.log.info("⚙️  Leverage set: %s  %dx (long + short)", symbol, lev)
+            except Exception as exc:
+                self.log.warning("⚠️  Could not set leverage for %s: %s", symbol, exc)
 
     # ── Startup sequence ──────────────────────────────────────────────────────
 
@@ -264,8 +298,11 @@ class TradingBot:
           4. Train initial model on historical data
         """
         self.log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        self.log.info("  STARTUP PIPELINE")
+        self.log.info("  STARTUP PIPELINE  (FUTURES mode)")
         self.log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Step 0: Set leverage for all pairs ───────────────────────────────
+        self._setup_leverage()
 
         # ── Step 1: Data collection ───────────────────────────────────────────
         self.log.info("STEP 1/3  Data collection")
@@ -500,7 +537,7 @@ class TradingBot:
             return False
 
         if signal == BUY:
-            order_id = self._buy(symbol, qty, price)
+            order_id = self._open_long(symbol, qty, price)
             if order_id:
                 pos = Position(
                     pair=symbol, side="long",
@@ -512,18 +549,26 @@ class TradingBot:
                     order_id=order_id,
                 )
                 self.risk.open_position(pos)
+                self.log.info("🟢 LONG opened  %s  qty=%.5f @ £%.4f  SL=£%.4f  TP=£%.4f",
+                              symbol, qty, price, sl, tp)
                 return True
 
-        elif signal == SELL and symbol in self.risk.open_positions:
-            pos = self.risk.open_positions[symbol]
-            self._sell(symbol, pos.quantity, price)
-            trade = self.risk.close_position(symbol, price)
-            if trade:
-                self.logger.log_trade(trade, self.risk.equity, "signal_exit")
-                self.strategy.record_outcome(
-                    trade, df, symbol=symbol,
-                    timeframe_label=TF_LABELS.get(self.tf, "4h"),
+        elif signal == SELL:
+            order_id = self._open_short(symbol, qty, price)
+            if order_id:
+                pos = Position(
+                    pair=symbol, side="short",
+                    entry_price=price, quantity=qty,
+                    stop_loss=sl, take_profit=tp,
+                    tp1_price=tp1, quantity_original=qty,
+                    leverage=leverage,
+                    entry_time=utcnow().isoformat(),
+                    order_id=order_id,
                 )
+                self.risk.open_position(pos)
+                self.log.info("🔴 SHORT opened  %s  qty=%.5f @ £%.4f  SL=£%.4f  TP=£%.4f",
+                              symbol, qty, price, sl, tp)
+                return True
 
         return False
 
@@ -557,9 +602,8 @@ class TradingBot:
 
             # ── TP1: partial close — position stays open ───────────────────
             if exit_reason == "tp1":
-                self._sell(symbol,
-                           round(pos.quantity_original * self.risk.tp1_close_pct, 6),
-                           price)
+                partial_qty = round(pos.quantity_original * self.risk.tp1_close_pct, 6)
+                self._close_pos(symbol, partial_qty, price, pos.side)
                 trade = self.risk.partial_close(symbol, price)
                 if trade:
                     self.logger.log_trade(trade, self.risk.equity, "tp1_partial")
@@ -569,7 +613,7 @@ class TradingBot:
             # ── SL or final TP: full close ─────────────────────────────────
             if exit_reason in ("stop_loss", "take_profit"):
                 self.log.info("🚨 %s  %s  @ £%.4f", exit_reason.upper(), symbol, price)
-                self._sell(symbol, pos.quantity, price)
+                self._close_pos(symbol, pos.quantity, price, pos.side)
                 trade = self.risk.close_position(symbol, price)
                 if trade:
                     self.logger.log_trade(trade, self.risk.equity, exit_reason)
@@ -587,7 +631,7 @@ class TradingBot:
                 if self._ltf_reversal(ltf_df, pos.side):
                     self.log.info("📉 LTF reversal exit  %s  @ £%.4f  (1h %s signal)",
                                   symbol, price, self.ltf_label)
-                    self._sell(symbol, pos.quantity, price)
+                    self._close_pos(symbol, pos.quantity, price, pos.side)
                     trade = self.risk.close_position(symbol, price)
                     if trade:
                         self.logger.log_trade(trade, self.risk.equity, "ltf_reversal")
@@ -746,7 +790,7 @@ class TradingBot:
     # ── Run loop ──────────────────────────────────────────────────────────────
 
     def run(self):
-        self.log.info("🚀 Weex Trading Bot  v3  starting…")
+        self.log.info("🚀 Weex Futures Trading Bot  v3  starting…")
         self.log.info("   Pairs      : %s", [p["name"] for p in self.pairs])
         self.log.info("   Signal TF  : %s min (per-symbol TFs applied after analysis)", self.tf)
         self.log.info("   Filter TF  : %s (HTF confluence)", self.htf_label)
@@ -809,6 +853,7 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
+
 
 
 
