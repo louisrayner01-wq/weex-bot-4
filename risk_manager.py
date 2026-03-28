@@ -36,6 +36,11 @@ class Position:
     tp1_price:          float = 0.0    # TP1 price level (set on open)
     tp1_hit:            bool  = False  # True once 50% has been closed at TP1
     quantity_original:  float = 0.0   # Full qty at entry (before any partial close)
+    # ── MAE / MFE excursion tracking ─────────────────────────────────────────
+    mae_pct:            float = 0.0   # Max Adverse Excursion as fraction of entry (e.g. 0.012 = 1.2%)
+    mfe_pct:            float = 0.0   # Max Favorable Excursion as fraction of entry
+    entry_candle_low:   float = 0.0   # Low of the entry candle (wick level for longs)
+    entry_candle_high:  float = 0.0   # High of the entry candle (wick level for shorts)
 
     @property
     def rr_ratio(self) -> float:
@@ -156,6 +161,9 @@ class RiskManager:
             "pnl_usdt":     pnl_usdt,
             "candles_held": pos.candles_held,
             "exit_type":    "tp1_partial",
+            "mae_pct":      round(pos.mae_pct * 100, 4),
+            "mfe_pct":      round(pos.mfe_pct * 100, 4),
+            "wick_breach":  0,   # wick breach measured at full close only
         }
 
     # ── R/R validation ────────────────────────────────────────────────────────
@@ -238,6 +246,28 @@ class RiskManager:
             return False, f"equity (£{self.equity:.2f}) below minimum trade risk (£{self.risk_per_trade_abs})"
         return True, "ok"
 
+    def update_excursion(self, pair: str, current_price: float):
+        """
+        Called on every price check (every 5 min) to keep MAE and MFE current.
+
+        MAE (Max Adverse Excursion)  — how far price moved *against* us as % of entry
+        MFE (Max Favorable Excursion) — how far price moved *for* us as % of entry
+
+        For a long  → adverse = below entry, favorable = above entry
+        For a short → adverse = above entry, favorable = below entry
+        """
+        pos = self.open_positions.get(pair)
+        if not pos:
+            return
+        if pos.side == "long":
+            adverse   = max(0.0, (pos.entry_price - current_price) / pos.entry_price)
+            favorable = max(0.0, (current_price   - pos.entry_price) / pos.entry_price)
+        else:
+            adverse   = max(0.0, (current_price   - pos.entry_price) / pos.entry_price)
+            favorable = max(0.0, (pos.entry_price - current_price)   / pos.entry_price)
+        pos.mae_pct = max(pos.mae_pct, adverse)
+        pos.mfe_pct = max(pos.mfe_pct, favorable)
+
     def should_exit(self, pair: str, current_price: float) -> Optional[str]:
         pos = self.open_positions.get(pair)
         if not pos:
@@ -294,15 +324,29 @@ class RiskManager:
             emoji, pair, exit_price, pnl_pct * 100, pnl_usdt, self.equity,
         )
 
+        # Did price breach the entry candle's wick before closing?
+        # Long: wick breach = price went below the entry candle's low
+        # Short: wick breach = price went above the entry candle's high
+        worst_price = pos.entry_price * (1 - pos.mae_pct) if pos.side == "long" \
+                 else pos.entry_price * (1 + pos.mae_pct)
+        if pos.side == "long":
+            wick_breach = 1 if (pos.entry_candle_low > 0 and worst_price < pos.entry_candle_low) else 0
+        else:
+            wick_breach = 1 if (pos.entry_candle_high > 0 and worst_price > pos.entry_candle_high) else 0
+
         return {
-            "pair":         pair,
-            "side":         pos.side,
-            "entry_price":  pos.entry_price,
-            "exit_price":   exit_price,
-            "quantity":     pos.quantity,
-            "leverage":     pos.leverage,
-            "pnl_pct":      pnl_pct,
-            "pnl_usdt":     pnl_usdt,
-            "candles_held": pos.candles_held,
+            "pair":              pair,
+            "side":              pos.side,
+            "entry_price":       pos.entry_price,
+            "exit_price":        exit_price,
+            "quantity":          pos.quantity,
+            "leverage":          pos.leverage,
+            "pnl_pct":           pnl_pct,
+            "pnl_usdt":          pnl_usdt,
+            "candles_held":      pos.candles_held,
+            "mae_pct":           round(pos.mae_pct * 100, 4),   # % e.g. 1.25
+            "mfe_pct":           round(pos.mfe_pct * 100, 4),
+            "wick_breach":       wick_breach,
         }
+
 
