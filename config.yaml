@@ -6,7 +6,7 @@ exchange:
   api_key:     "YOUR_API_KEY"
   api_secret:  "YOUR_SECRET_KEY"
   passphrase:  "YOUR_PASSPHRASE"
-  base_url:    "https://api.weex.com"   # Futures (UMCBL) base URL
+  base_url:    "https://api-spot.weex.com"   # Spot API base URL (contract API auto-routes to api-contract.weex.com)
 
 # ── Set paper_trading: true while testing. Change to false for live. ──
 trading:
@@ -106,5 +106,6 @@ data:
 
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  7
+
 
 
