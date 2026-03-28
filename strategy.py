@@ -181,9 +181,15 @@ class TradingStrategy:
 
         os.makedirs(self.models_dir, exist_ok=True)
 
+        # Default model (primary pair / backward-compat fallback)
         self.model: Optional[CalibratedClassifierCV] = None
         self.scaler = StandardScaler()
         self.selected_features: List[str] = list(FEATURE_COLS)
+
+        # Per-symbol models — each pair can train on its own optimal timeframe
+        self.symbol_models:   Dict[str, CalibratedClassifierCV] = {}
+        self.symbol_scalers:  Dict[str, StandardScaler]         = {}
+        self.symbol_features: Dict[str, List[str]]              = {}
 
         self.total_trades    = 0
         self.trades_since_retrain = 0
@@ -195,11 +201,24 @@ class TradingStrategy:
         self._load_analysis_results()
 
         self._try_load_model()
+        self._try_load_symbol_models()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def _model_path(self):  return os.path.join(self.models_dir, "ensemble_model.joblib")
-    def _meta_path(self):   return os.path.join(self.models_dir, "meta.joblib")
+    @staticmethod
+    def _sym_key(symbol: str) -> str:
+        """Strip exchange suffix so 'ETHUSDT_SPBL' → 'ETHUSDT'."""
+        return symbol.replace("_SPBL", "").replace("_UMCBL", "")
+
+    def _model_path(self, sym_key: str = "") -> str:
+        if sym_key:
+            return os.path.join(self.models_dir, f"model_{sym_key}.joblib")
+        return os.path.join(self.models_dir, "ensemble_model.joblib")
+
+    def _meta_path(self, sym_key: str = "") -> str:
+        if sym_key:
+            return os.path.join(self.models_dir, f"meta_{sym_key}.joblib")
+        return os.path.join(self.models_dir, "meta.joblib")
 
     def _try_load_model(self):
         if os.path.exists(self._model_path()):
@@ -214,15 +233,46 @@ class TradingStrategy:
             except Exception as exc:
                 logger.warning("Could not load model (%s) — will train fresh.", exc)
 
-    def _save_model(self):
-        joblib.dump(self.model, self._model_path())
+    def _try_load_symbol_models(self):
+        """Load any previously saved per-symbol models from disk."""
+        try:
+            for fname in os.listdir(self.models_dir):
+                if not (fname.startswith("model_") and fname.endswith(".joblib")):
+                    continue
+                sym_key   = fname[len("model_"):-len(".joblib")]
+                meta_path = self._meta_path(sym_key)
+                if not os.path.exists(meta_path):
+                    continue
+                try:
+                    model = joblib.load(self._model_path(sym_key))
+                    meta  = joblib.load(meta_path)
+                    self.symbol_models[sym_key]   = model
+                    self.symbol_scalers[sym_key]  = meta["scaler"]
+                    self.symbol_features[sym_key] = meta["features"]
+                    logger.info("✅ Loaded per-symbol model: %s", sym_key)
+                except Exception as exc:
+                    logger.warning("Could not load model %s: %s", sym_key, exc)
+        except Exception:
+            pass   # models_dir may not exist yet on first run
+
+    def _save_model(self, sym_key: str = ""):
+        """Save model to disk. Pass sym_key to save a per-symbol model."""
+        if sym_key:
+            model   = self.symbol_models.get(sym_key, self.model)
+            scaler  = self.symbol_scalers.get(sym_key, self.scaler)
+            features = self.symbol_features.get(sym_key, self.selected_features)
+        else:
+            model, scaler, features = self.model, self.scaler, self.selected_features
+
+        joblib.dump(model, self._model_path(sym_key))
         joblib.dump({
-            "scaler":        self.scaler,
-            "features":      self.selected_features,
+            "scaler":        scaler,
+            "features":      features,
             "total_trades":  self.total_trades,
             "trade_history": self.stats._history,
-        }, self._meta_path())
-        logger.info("💾 Model saved (%d total trades)", self.total_trades)
+        }, self._meta_path(sym_key))
+        label = sym_key or "default"
+        logger.info("💾 Model saved [%s] (%d total trades)", label, self.total_trades)
 
     # ── Analysis integration ──────────────────────────────────────────────────
 
@@ -440,38 +490,59 @@ class TradingStrategy:
         logger.info("Top features: %s",
                     {f: round(importances[f], 3) for f in top5})
 
-        self._save_model()
+        # ── Store model (per-symbol when symbol given; always update default) ──
+        if symbol:
+            sym_key = self._sym_key(symbol)
+            self.symbol_models[sym_key]   = self.model
+            self.symbol_scalers[sym_key]  = self.scaler
+            self.symbol_features[sym_key] = self.selected_features
+            self._save_model(sym_key)
+        else:
+            self._save_model()
+
         self.trades_since_retrain = 0
 
     # ── Prediction ────────────────────────────────────────────────────────────
 
-    def predict(self, df: pd.DataFrame) -> Tuple[int, float, float]:
+    def predict(self, df: pd.DataFrame, symbol: str = "") -> Tuple[int, float, float]:
         """
         Returns (signal, buy_probability, sell_probability).
         signal: BUY (1), HOLD (0), SELL (-1)
         Probabilities are calibrated — 0.65 really does mean ~65% likely.
+
+        If a per-symbol model has been trained (via train(..., symbol=...)),
+        that model is used. Otherwise falls back to the default model.
         """
-        if self.model is None:
+        # Resolve which model/scaler/features to use
+        sym_key = self._sym_key(symbol) if symbol else ""
+        if sym_key and sym_key in self.symbol_models:
+            model   = self.symbol_models[sym_key]
+            scaler  = self.symbol_scalers[sym_key]
+            feats   = self.symbol_features[sym_key]
+        elif self.model is not None:
+            model   = self.model
+            scaler  = self.scaler
+            feats   = self.selected_features
+        else:
             return HOLD, 0.0, 0.0
 
         X = self._prepare_X(df)
-        # Only use features the scaler was trained on
-        feats = [c for c in self.selected_features if c in X.columns]
+        feats = [c for c in feats if c in X.columns]
         if not feats or X.empty:
             return HOLD, 0.0, 0.0
 
         try:
             last_row = X[feats].iloc[[-1]]
             X_scaled = pd.DataFrame(
-                self.scaler.transform(last_row),
+                scaler.transform(last_row),
                 columns=feats
             )
         except Exception as exc:
             logger.debug("Prediction transform error: %s", exc)
             return HOLD, 0.0, 0.0
 
-        proba   = self.model.predict_proba(X_scaled)[0]
-        classes = list(self.model.classes_)
+        proba   = model.predict_proba(X_scaled)[0]
+        classes = list(model.classes_)
 
         buy_p  = float(proba[classes.index(BUY)])  if BUY  in classes else 0.0
         sell_p = float(proba[classes.index(SELL)]) if SELL in classes else 0.0
@@ -539,5 +610,6 @@ class TradingStrategy:
 
     def best_pairs(self) -> Dict[str, float]:
         return self.stats.rank_pairs()
+
 
 
