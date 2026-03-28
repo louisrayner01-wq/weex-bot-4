@@ -89,9 +89,9 @@ INITIAL_FETCH_DAYS = {
     "1440": 730,   # ~730   candles in   1 batch
 }
 
-# Spot API allows up to 1000 candles per request — use the maximum to make
-# the 2-year backfill as fast as possible (~5 batches for 4h, ~18 for 1h).
-BATCH_SIZE = 1000
+# 200 candles per request — conservative limit that works reliably with
+# time-bounded queries (startTime / endTime) on the Weex spot API.
+BATCH_SIZE = 200
 
 
 # ── Core collector ────────────────────────────────────────────────────────────
@@ -389,5 +389,6 @@ if __name__ == "__main__":
     data_dir = cfg.get("data", {}).get("data_dir", "/data")
     collector = DataCollector(client, data_dir=data_dir)
     collector.collect_all()
+
 
 
