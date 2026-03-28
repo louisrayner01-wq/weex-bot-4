@@ -19,6 +19,10 @@ class TradeLogger:
         "timestamp", "pair", "side", "entry_price", "exit_price",
         "quantity", "leverage", "pnl_pct", "pnl_usdt", "candles_held",
         "exit_reason", "equity_after",
+        # MAE / MFE — recorded per trade for stop-loss optimisation
+        "mae_pct",      # Max Adverse Excursion as % of entry (e.g. 1.25 = 1.25%)
+        "mfe_pct",      # Max Favorable Excursion as % of entry
+        "wick_breach",  # 1 if price violated the entry candle's wick before close
     ]
 
     def __init__(self, trades_file: str):
@@ -47,6 +51,9 @@ class TradeLogger:
             "candles_held": trade.get("candles_held", 0),
             "exit_reason":  exit_reason,
             "equity_after": round(equity_after, 2),
+            "mae_pct":      round(trade.get("mae_pct", 0.0), 4),
+            "mfe_pct":      round(trade.get("mfe_pct", 0.0), 4),
+            "wick_breach":  trade.get("wick_breach", 0),
         }
         self.records.append(row)
         with open(self.trades_file, "a", newline="") as f:
@@ -87,3 +94,4 @@ class TradeLogger:
             pair_wins   = sum(1 for r in pair_trades if r["pnl_usdt"] > 0)
             logger.info("  %-18s  trades=%d  wins=%d  PnL=%.2f USDT",
                         pair, len(pair_trades), pair_wins, pair_pnl)
+
