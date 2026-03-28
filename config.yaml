@@ -6,24 +6,24 @@ exchange:
   api_key:     "YOUR_API_KEY"
   api_secret:  "YOUR_SECRET_KEY"
   passphrase:  "YOUR_PASSPHRASE"
-  base_url:    "https://api-spot.weex.com"
+  base_url:    "https://api.weex.com"   # Futures (UMCBL) base URL
 
 # ── Set paper_trading: true while testing. Change to false for live. ──
 trading:
   paper_trading: true
 
   pairs:
-    - symbol:     "BTCUSDT_SPBL"
+    - symbol:     "BTCUSDT_UMCBL"
       name:       "BTC"
       enabled:    true
       allocation: 0.50       # 50 % of capital starts on BTC
 
-    - symbol:     "ETHUSDT_SPBL"
+    - symbol:     "ETHUSDT_UMCBL"
       name:       "ETH"
       enabled:    true
       allocation: 0.30
 
-    - symbol:     "SOLUSDT_SPBL"
+    - symbol:     "SOLUSDT_UMCBL"
       name:       "SOL"
       enabled:    true
       allocation: 0.20
@@ -59,8 +59,8 @@ strategy:
   # ── Signal thresholds ──────────────────────────────────────────────────────
   # Early-stage values — model has limited data so probabilities cluster near 0.33.
   # Raise buy_threshold toward 0.55–0.60 once the bot has 50+ completed trades.
-  buy_threshold:    0.45   # Buy when calibrated probability > 45 %
-  sell_threshold:   0.35   # Exit when probability < 35 %
+  buy_threshold:    0.40   # Buy when calibrated probability > 40 %
+  sell_threshold:   0.35   # Sell when calibrated probability > 35 %
 
   # ── Trade quality gates (BOTH must pass before entering a trade) ───────────
   min_ev:           0.001  # Minimum Expected Value (EV > 0.1 % per trade)
@@ -86,7 +86,7 @@ strategy:
   # ── Labelling ──────────────────────────────────────────────────────────────
   min_training_samples:  60    # Don't train until we have at least 60 labelled samples
   label_horizon_candles:  4    # Look 4 candles forward to label BUY / HOLD / SELL
-  label_move_threshold: 0.015  # 1.5 % move — meaningful on 4h candles, filters noise
+  label_move_threshold: 0.010  # 1.0 % move — generates more BUY/SELL labels, reduces HOLD dominance
 
 logging:
   log_file:    "logs/bot.log"
@@ -106,4 +106,5 @@ data:
 
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  7
+
 
