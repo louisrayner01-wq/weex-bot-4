@@ -1,8 +1,15 @@
 """
 weex_client.py
-Handles all communication with the Weex Spot REST API.
+Handles all communication with the Weex REST API.
+Supports both Spot (SPBL) and Futures/Perpetuals (UMCBL).
 Includes HMAC-SHA256 authentication, rate-limit awareness,
 and a clean interface for market data + order management.
+
+Futures order sides:
+  open_long   — buy to open a long position
+  open_short  — sell to open a short position
+  close_long  — sell to close a long position
+  close_short — buy to close a short position
 """
 
 import hashlib
@@ -29,8 +36,19 @@ ENDPOINTS = {
     "open_orders":   "/api/v2/trade/unfilled-orders",
 }
 
-# Map our minute-based timeframe config values → Weex interval strings
-# e.g. config "60" → "1h", "240" → "4h"
+# ── Weex Futures (UMCBL) API endpoints ────────────────────────────────────────
+FUTURES_ENDPOINTS = {
+    "place_order":   "/api/mix/v1/order/placeOrder",
+    "cancel_order":  "/api/mix/v1/order/cancel-order",
+    "set_leverage":  "/api/mix/v1/account/setLeverage",
+    "account":       "/api/mix/v1/account/account",
+    "position":      "/api/mix/v1/position/singlePosition",
+    "open_orders":   "/api/mix/v1/order/current",
+    # Futures OHLCV candles — uses full _UMCBL symbol and granularity param
+    "candles":       "/api/mix/v1/market/candles",
+}
+
+# Map our minute-based timeframe config values → Weex spot interval strings
 INTERVAL_MAP = {
     "1":    "1m",
     "3":    "3m",
@@ -44,6 +62,25 @@ INTERVAL_MAP = {
     "720":  "12h",
     "1440": "1d",
 }
+
+# Map our minute-based timeframe config values → Weex futures granularity strings
+# Futures API uses different format from spot: "1min", "1H", "1D" etc.
+FUTURES_INTERVAL_MAP = {
+    "1":    "1min",
+    "3":    "3min",
+    "5":    "5min",
+    "15":   "15min",
+    "30":   "30min",
+    "60":   "1H",
+    "120":  "2H",
+    "240":  "4H",
+    "360":  "6H",
+    "720":  "12H",
+    "1440": "1D",
+}
+
+# Weex futures candles API returns at most 200 candles per request
+FUTURES_CANDLE_LIMIT = 200
 
 def _market_symbol(symbol: str) -> str:
     """
@@ -89,27 +126,51 @@ class WeexClient:
 
     # ── HTTP helpers ───────────────────────────────────────────────────────────
 
+    # Fallback domains tried in order if the primary base_url fails DNS resolution.
+    _FALLBACK_DOMAINS = [
+        "https://api-spot.weex.com",
+        "https://api.weex.com",
+    ]
+
     def _get(self, path: str, params: Optional[Dict] = None, auth: bool = True) -> Dict:
         qs = ""
         if params:
             qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        headers = self._auth_headers("GET", path + qs) if auth else {}
-        try:
-            resp = self.session.get(self.base_url + path + qs, headers=headers, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            # Some Weex endpoints (e.g. klines) return a raw list, not {"data": [...]}
-            if isinstance(data, list):
-                return {"data": data, "code": "0"}
-            if data.get("code") not in (None, "0", 0, "00000"):
-                logger.warning("API warning [GET %s]: %s", path, data)
-            return data
-        except Exception as exc:
-            # 404s are logged at DEBUG — callers (e.g. get_ticker) handle missing
-            # data gracefully so there is no need to pollute INFO/WARNING logs.
-            level = logging.DEBUG if "404" in str(exc) else logging.ERROR
-            logger.log(level, "GET %s failed: %s", path, exc)
-            return {}
+
+        # Build list of base URLs to try: configured domain first, then fallbacks
+        candidates = [self.base_url] + [
+            d for d in self._FALLBACK_DOMAINS if d != self.base_url
+        ]
+
+        last_exc: Optional[Exception] = None
+        for base in candidates:
+            headers = self._auth_headers("GET", path + qs) if auth else {}
+            try:
+                resp = self.session.get(base + path + qs, headers=headers, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                # If a fallback domain worked, switch to it permanently
+                if base != self.base_url:
+                    logger.info("⚡ Switched API base URL: %s → %s", self.base_url, base)
+                    self.base_url = base
+                # Some Weex endpoints (e.g. klines) return a raw list, not {"data": [...]}
+                if isinstance(data, list):
+                    return {"data": data, "code": "0"}
+                if data.get("code") not in (None, "0", 0, "00000"):
+                    logger.warning("API warning [GET %s]: %s", path, data)
+                return data
+            except Exception as exc:
+                last_exc = exc
+                is_dns = "NameResolution" in str(type(exc).__name__) or "Name or service not known" in str(exc)
+                if is_dns and base != candidates[-1]:
+                    logger.debug("DNS failure on %s — trying next domain…", base)
+                    continue   # try the next domain
+                # Non-DNS error or last candidate — log and give up
+                level = logging.DEBUG if "404" in str(exc) else logging.ERROR
+                logger.log(level, "GET %s failed: %s", path, exc)
+                return {}
+
+        return {}
 
     def _post(self, path: str, payload: Dict, auth: bool = True) -> Dict:
         body = json.dumps(payload, separators=(",", ":"))
@@ -157,19 +218,39 @@ class WeexClient:
             paginating through historical data.
         Returns list of [timestamp_ms, open, high, low, close, volume] in
             chronological order.
+
+        Routes automatically:
+          _UMCBL symbols → futures endpoint (/api/mix/v1/market/candles),
+                           granularity param, max 200 candles per call.
+          plain symbols  → spot endpoint (/api/v3/market/klines),
+                           interval param, up to 1000 candles per call.
         """
-        interval = INTERVAL_MAP.get(str(granularity), "1h")
-        params: Dict[str, Any] = {
-            "symbol":   _market_symbol(symbol),
-            "interval": interval,
-            "limit":    limit,
-        }
+        is_futures = "_UMCBL" in symbol or "_DMCBL" in symbol
+
+        if is_futures:
+            interval  = FUTURES_INTERVAL_MAP.get(str(granularity), "1H")
+            endpoint  = FUTURES_ENDPOINTS["candles"]
+            limit     = min(limit, FUTURES_CANDLE_LIMIT)
+            params: Dict[str, Any] = {
+                "symbol":      symbol,    # keep full _UMCBL suffix
+                "granularity": interval,
+                "limit":       limit,
+            }
+        else:
+            interval  = INTERVAL_MAP.get(str(granularity), "1h")
+            endpoint  = ENDPOINTS["candles"]
+            params = {
+                "symbol":   _market_symbol(symbol),
+                "interval": interval,
+                "limit":    limit,
+            }
+
         if start_time is not None:
             params["startTime"] = start_time
         if end_time is not None:
             params["endTime"] = end_time
 
-        data = self._get(ENDPOINTS["candles"], params, auth=False)
+        data = self._get(endpoint, params, auth=False)
         raw = data.get("data", [])
         if not raw:
             logger.debug("Empty candle response for %s: %s", symbol, data)
@@ -238,10 +319,62 @@ class WeexClient:
         data = self._get(ENDPOINTS["open_orders"], {"symbol": symbol})
         return data.get("data", {}).get("orderList", [])
 
+    # ── Futures / perpetuals (UMCBL) ──────────────────────────────────────────
+
+    def set_leverage(self, symbol: str, leverage: int,
+                     hold_side: str = "long") -> Dict:
+        """
+        Set leverage for a futures symbol.
+        hold_side: 'long' | 'short'  (call once for each side before trading)
+        """
+        payload = {
+            "symbol":     symbol,
+            "marginCoin": "USDT",
+            "leverage":   str(leverage),
+            "holdSide":   hold_side,
+        }
+        logger.info("Setting leverage %dx for %s (%s)", leverage, symbol, hold_side)
+        return self._post(FUTURES_ENDPOINTS["set_leverage"], payload)
+
+    def futures_order(self, symbol: str, side: str, qty: float) -> Dict:
+        """
+        Place a futures market order.
+        side: 'open_long' | 'open_short' | 'close_long' | 'close_short'
+        qty: contract size (base currency units, e.g. BTC)
+        """
+        payload = {
+            "symbol":     symbol,
+            "marginCoin": "USDT",
+            "size":       str(round(qty, 6)),
+            "side":       side,
+            "orderType":  "market",
+        }
+        logger.info("Futures %s  %s  qty=%s", side.upper(), symbol, qty)
+        return self._post(FUTURES_ENDPOINTS["place_order"], payload)
+
+    def get_futures_balance(self, ref_symbol: str = "BTCUSDT_UMCBL") -> float:
+        """Return available USDT balance in the futures (UMCBL) account."""
+        data = self._get(FUTURES_ENDPOINTS["account"],
+                         {"symbol": ref_symbol, "marginCoin": "USDT"})
+        account = data.get("data", {})
+        return float(account.get("available", 0) or 0)
+
+    def get_futures_position(self, symbol: str) -> Optional[Dict]:
+        """Return the open position dict for a symbol, or None if flat."""
+        data = self._get(FUTURES_ENDPOINTS["position"],
+                         {"symbol": symbol, "marginCoin": "USDT"})
+        positions = data.get("data", [])
+        if isinstance(positions, list):
+            for p in positions:
+                if float(p.get("total", 0) or 0) > 0:
+                    return p
+        return None
+
     # ── Utility ───────────────────────────────────────────────────────────────
 
     def ping(self) -> bool:
         """Quick connectivity check using public ticker endpoint."""
         result = self.get_ticker("BTCUSDT")
         return result is not None
+
 
