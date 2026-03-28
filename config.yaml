@@ -105,7 +105,7 @@ data:
   confluence_timeframe: "1440"  # 1d filter applied on top of 4h signals
 
   # Analysis results older than this many days trigger a fresh analysis run
-  analysis_stale_days:  7
+  analysis_stale_days:  0   # 0 = always re-run (reset to 7 after first good run)
 
 
 
