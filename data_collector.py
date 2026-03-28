@@ -60,10 +60,12 @@ TF_LABELS = {
     "1440": "1d",
 }
 
-# Use the futures (UMCBL) symbol format so candle data comes from the futures
-# market endpoint — correct data source for a futures trading bot.
-# CSV filenames still use the plain form (BTCUSDT_4h.csv) via _filepath().
-SYMBOLS: List[str] = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL"]
+# Use plain (spot) symbol format for OHLCV history collection.
+# The spot API at /api/v3/market/klines supports endTime pagination so we can
+# backfill 2 years of data.  Spot and futures prices for BTC/ETH/SOL are
+# effectively identical for ML training purposes.
+# _UMCBL symbols are only used for live order execution in weex_client.
+SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 REQUEST_DELAY = 0.5   # seconds between requests (rate-limit safety)
 
@@ -80,16 +82,16 @@ TF_REFRESH_MINUTES = {
 # Shorter timeframes accumulate fast, so 5m is capped at 60 days to avoid
 # thousands of API calls on first boot.
 INITIAL_FETCH_DAYS = {
-    "5":     60,   # ~17 280 candles in ~18 batches
-    "15":   730,   # ~70 080 candles in ~71 batches
+    "5":     60,   # ~17 280 candles in ~18 batches  (monitoring only)
+    "15":   730,   # ~70 080 candles in ~71 batches  (ETH training tf)
     "60":   730,   # ~17 520 candles in ~18 batches
-    "240":  730,   # ~4 380 candles in ~5 batches
-    "1440": 730,   # ~730 candles in 1 batch
+    "240":  730,   # ~4 380 candles in  ~5 batches   (BTC/SOL training tf)
+    "1440": 730,   # ~730   candles in   1 batch
 }
 
-# Futures API caps at 200 candles per request (spot allowed 1000).
-# The paginator will make more round-trips but still collects the full history.
-BATCH_SIZE = 200
+# Spot API allows up to 1000 candles per request — use the maximum to make
+# the 2-year backfill as fast as possible (~5 batches for 4h, ~18 for 1h).
+BATCH_SIZE = 1000
 
 
 # ── Core collector ────────────────────────────────────────────────────────────
@@ -166,7 +168,8 @@ class DataCollector:
         # If the oldest candle in the CSV is more than 30 days newer than our
         # 2-year target, the data is too thin for good model training.
         # We backfill by paginating backwards and merging with the existing CSV.
-        if existing is not None and not existing.empty:
+        # Skip for 5m — it is monitoring-only and doesn't need 2 years of data.
+        if timeframe_min != "5" and existing is not None and not existing.empty:
             target_start = (pd.Timestamp.now('UTC').tz_localize(None)
                             - pd.Timedelta(days=days))
             oldest_candle = existing["timestamp"].min()
