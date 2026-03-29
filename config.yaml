@@ -108,8 +108,10 @@ data:
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  0   # 0 = always re-run (reset to 7 after first good run)
 
-  # Hard cap on signal timeframe — analysis may recommend 1d for ETH/SOL but
-  # daily candles give only 730 samples which isn't enough for reliable models.
-  # 4h gives ~4380 candles for all symbols (same as BTC) and is the sweet spot.
-  max_signal_tf_minutes: 240   # Never assign a TF slower than 4h
+  # Signal timeframe bounds — analysis picks the best TF per symbol automatically.
+  # min: block 5m (too noisy, loop would run every 5 min, high fee cost)
+  # max: block 1d (only 730 candles — too thin for reliable models)
+  # 15m (~70k candles), 1h (~17k), 4h (~4.4k) all compete on CV accuracy.
+  min_signal_tf_minutes: 15    # Never go faster than 15m for signals
+  max_signal_tf_minutes: 240   # Never go slower than 4h for signals
 
