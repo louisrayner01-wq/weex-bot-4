@@ -450,6 +450,32 @@ class TradingBot:
             }
             self.log.info("📊 Per-symbol TF assignments: %s", assignments)
 
+        # ── Cap TF recommendations if max_signal_tf_minutes is set ──────────────
+        # Prevents analysis from assigning thin-data daily TFs when we have
+        # richer 4h data available (~4380 candles vs 730 for 1d).
+        max_tf_cfg = self.cfg.get("data", {}).get("max_signal_tf_minutes")
+        if max_tf_cfg:
+            max_tf_str = str(int(max_tf_cfg))
+            max_tf_int = int(max_tf_cfg)
+            # Cap per-symbol TFs
+            for sym in list(self.symbol_tf.keys()):
+                if int(self.symbol_tf[sym]) > max_tf_int:
+                    capped_htf = HTF_UP.get(max_tf_str, "1440")
+                    old = TF_LABELS.get(self.symbol_tf[sym], self.symbol_tf[sym])
+                    self.symbol_tf[sym]  = max_tf_str
+                    self.symbol_htf[sym] = capped_htf
+                    self.log.info("📊 %s TF capped: %s → %s (max_signal_tf_minutes=%s)",
+                                  sym, old, TF_LABELS.get(max_tf_str, max_tf_str), max_tf_str)
+            # Cap global TF + fix loop interval to match
+            if int(self.tf) > max_tf_int:
+                old_tf  = TF_LABELS.get(self.tf, self.tf)
+                self.tf = max_tf_str
+                new_interval = TF_INTERVALS.get(max_tf_str,
+                               self.cfg["trading"]["loop_interval_s"])
+                self.cfg["trading"]["loop_interval_s"] = new_interval
+                self.log.info("📊 Global TF capped: %s → %s  (loop=%ds)",
+                              old_tf, TF_LABELS.get(max_tf_str, max_tf_str), new_interval)
+
         # Log top features so they're visible in logs
         top_feats = recs.get("top_features", [])[:5]
         if top_feats:
