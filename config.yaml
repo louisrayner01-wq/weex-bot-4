@@ -59,8 +59,8 @@ strategy:
   # ── Signal thresholds ──────────────────────────────────────────────────────
   # Early-stage values — model has limited data so probabilities cluster near 0.33.
   # Raise buy_threshold toward 0.55–0.60 once the bot has 50+ completed trades.
-  buy_threshold:    0.40   # Buy when calibrated probability > 40 %
-  sell_threshold:   0.35   # Sell when calibrated probability > 35 %
+  buy_threshold:    0.50   # Buy when calibrated probability > 50 % (raised from 0.40 — filters marginal signals)
+  sell_threshold:   0.45   # Sell when calibrated probability > 45 % (raised proportionally)
 
   # ── Trade quality gates (BOTH must pass before entering a trade) ───────────
   min_ev:           0.001  # Minimum Expected Value (EV > 0.1 % per trade)
