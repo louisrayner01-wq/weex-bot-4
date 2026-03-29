@@ -457,9 +457,25 @@ class TradingStrategy:
                 df = combined
 
         df = compute_features(df)
-        # Use per-timeframe threshold if available; fall back to config value
+
+        # Priority order for label threshold:
+        #  1. Adaptive value computed by analysis.py from this symbol+TF's own
+        #     return distribution (guarantees ~33% directional labels per pair)
+        #  2. Static per-TF table (_TF_LABEL_THRESHOLD) — sensible defaults
+        #  3. Global config fallback
+        base_sym  = (symbol.replace("_UMCBL", "")
+                           .replace("_SPBL", "")
+                           .replace("_CMBL", ""))
         threshold = _TF_LABEL_THRESHOLD.get(timeframe_label, self.label_threshold)
-        logger.info("🏷️  Label threshold for %s [%s]: %.1f%%",
+        if self.analysis:
+            stored = (self.analysis
+                      .get("recommendations", {})
+                      .get("label_thresholds", {})
+                      .get(base_sym, {})
+                      .get(timeframe_label))
+            if stored is not None:
+                threshold = stored
+        logger.info("🏷️  Label threshold for %s [%s]: %.2f%% (adaptive from data)",
                     symbol or "?", timeframe_label, threshold * 100)
         labels = label_candles(df, self.label_horizon, threshold)
 
@@ -629,7 +645,6 @@ class TradingStrategy:
 
     def best_pairs(self) -> Dict[str, float]:
         return self.stats.rank_pairs()
-
 
 
 
