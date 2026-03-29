@@ -96,6 +96,28 @@ _DEFAULT_MIN_CANDLES = 100
 
 # ── Labelling ─────────────────────────────────────────────────────────────────
 
+def compute_adaptive_threshold(df: pd.DataFrame,
+                                horizon: int = LABEL_HORIZON,
+                                target_directional: float = 0.33) -> float:
+    """
+    Derive the label threshold directly from the data so that roughly
+    `target_directional` fraction of candles receive a BUY or SELL label.
+
+    Method: take the (1 − target_directional)th percentile of |forward returns|.
+    At this cut-off, exactly target_directional × 100% of candles have a move
+    large enough to be labelled — calibrated to *this* pair and *this* timeframe
+    automatically, no guessing required.
+
+    Clamped to [0.001, 0.15] so thin or extreme datasets can't produce nonsense.
+    """
+    future_ret = df["close"].pct_change(horizon).shift(-horizon).abs().dropna()
+    if len(future_ret) < 50:
+        return _DEFAULT_THRESH
+    pct_point = (1.0 - target_directional) * 100   # e.g. 67.0 for 33% directional
+    threshold = float(np.percentile(future_ret, pct_point))
+    return round(max(0.001, min(threshold, 0.15)), 4)
+
+
 def label_candles(df: pd.DataFrame,
                   horizon: int   = LABEL_HORIZON,
                   threshold: float = _DEFAULT_THRESH) -> pd.Series:
@@ -115,9 +137,11 @@ def analyse_timeframe(df: pd.DataFrame,
     Train and cross-validate a Random Forest on one timeframe.
     Returns a dict of metrics, or None if data is insufficient.
     """
-    # Pick TF-specific threshold and minimum sample count
-    thresh      = TF_LABEL_THRESH.get(tf_label, _DEFAULT_THRESH)
+    # Compute threshold from this pair's actual return distribution so that
+    # ~33% of candles get a directional label — no per-pair guessing needed.
+    # Falls back to the static TF table only if the dataset is too thin (<50 rows).
     min_samples = TF_MIN_SAMPLES.get(tf_label, _DEFAULT_MIN_SAMPLES)
+    thresh      = compute_adaptive_threshold(df)
 
     df = compute_features(df.copy())
     labels = label_candles(df, threshold=thresh)
@@ -169,19 +193,20 @@ def analyse_timeframe(df: pd.DataFrame,
     sells = int((y == SELL).sum())
 
     result = {
-        "symbol":       symbol,
-        "timeframe":    tf_label,
-        "samples":      len(df_feat),
-        "buy_count":    buys,
-        "sell_count":   sells,
-        "cv_accuracy":  round(accuracy, 4),
-        "cv_std":       round(float(np.std(cv_scores)), 4),
+        "symbol":          symbol,
+        "timeframe":       tf_label,
+        "samples":         len(df_feat),
+        "buy_count":       buys,
+        "sell_count":      sells,
+        "cv_accuracy":     round(accuracy, 4),
+        "cv_std":          round(float(np.std(cv_scores)), 4),
+        "label_threshold": thresh,   # adaptive — stored so strategy.py uses same value
         "feature_importance": {k: round(v, 6) for k, v in
                                sorted(importances.items(),
                                       key=lambda x: x[1], reverse=True)},
         "top_features": top_features,
     }
-    logger.info("  %s %s  |  acc=%.3f±%.3f  |  samples=%d (thresh=%.1f%%)  |  top=%s",
+    logger.info("  %s %s  |  acc=%.3f±%.3f  |  samples=%d  |  thresh=%.2f%% (adaptive)  |  top=%s",
                 symbol, tf_label, accuracy, np.std(cv_scores),
                 len(df_feat), thresh * 100, top_features[:3])
     return result
@@ -225,7 +250,7 @@ def analyse_confluence(signal_df: pd.DataFrame,
     Compare win rate on signal_tf with and without a filter_tf trend gate.
     Returns metrics dict.
     """
-    thresh      = TF_LABEL_THRESH.get(signal_tf, _DEFAULT_THRESH)
+    thresh      = compute_adaptive_threshold(signal_df)
     min_samples = TF_MIN_SAMPLES.get(signal_tf, _DEFAULT_MIN_SAMPLES)
 
     signal_df = compute_features(signal_df.copy())
@@ -460,6 +485,15 @@ class Analyzer:
                 best = max(sym_results, key=lambda x: x["cv_accuracy"])
                 per_symbol[symbol] = best["timeframe"]
 
+        # Per-symbol per-TF adaptive label thresholds — stored so strategy.py
+        # trains with exactly the same threshold that analysis evaluated each TF with.
+        label_thresholds: Dict[str, Dict[str, float]] = {}
+        for r in tf_results:
+            sym = r["symbol"]
+            tf  = r["timeframe"]
+            label_thresholds.setdefault(sym, {})[tf] = r.get("label_threshold",
+                                                              _DEFAULT_THRESH)
+
         # Confluence filter recommendation
         best_filter_tf = None
         if best_confluence:
@@ -480,6 +514,7 @@ class Analyzer:
             "timeframe_accuracy":     {tf: round(v, 4) for tf, v in
                                        sorted(tf_avg.items(), key=lambda x: x[1], reverse=True)},
             "per_symbol_best_tf":     per_symbol,
+            "label_thresholds":       label_thresholds,
         }
 
     # ── Report ────────────────────────────────────────────────────────────────
