@@ -46,6 +46,21 @@ HOLD =  0
 SELL = -1
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-timeframe label thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+# Must match analysis.py TF_LABEL_THRESH exactly — analysis picks the best
+# timeframe using these thresholds, then strategy trains on the same labels.
+# Mismatched thresholds would mean analysis scores TF A but strategy trains
+# on TF A with different labels — defeating the purpose of the analysis.
+_TF_LABEL_THRESHOLD = {
+    "5m":  0.003,   # 0.3 % — 5-min candles, 25-min lookahead
+    "15m": 0.005,   # 0.5 % — 15-min candles, 1-h lookahead
+    "1h":  0.008,   # 0.8 % — 1-h candles, 4-h lookahead
+    "4h":  0.015,   # 1.5 % — 4-h candles, 16-h lookahead
+    "1d":  0.020,   # 2.0 % — daily candles, 4-day lookahead
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Label generation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -442,7 +457,11 @@ class TradingStrategy:
                 df = combined
 
         df = compute_features(df)
-        labels = label_candles(df, self.label_horizon, self.label_threshold)
+        # Use per-timeframe threshold if available; fall back to config value
+        threshold = _TF_LABEL_THRESHOLD.get(timeframe_label, self.label_threshold)
+        logger.info("🏷️  Label threshold for %s [%s]: %.1f%%",
+                    symbol or "?", timeframe_label, threshold * 100)
+        labels = label_candles(df, self.label_horizon, threshold)
 
         available = [c for c in FEATURE_COLS if c in df.columns]
         X_raw = df[available].replace([np.inf, -np.inf], np.nan)
