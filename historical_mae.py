@@ -179,12 +179,13 @@ def _simulate_trade(
         wick_breach = 1 if (entry_candle_high > 0 and worst_price > entry_candle_high) else 0
 
     return {
-        "mae_pct":    mae_pct,
-        "mfe_pct":    mfe_pct,
-        "win":        outcome == "win",
+        "mae_pct":     mae_pct,
+        "mfe_pct":     mfe_pct,
+        "win":         outcome == "win",
         "wick_breach": wick_breach,
-        "outcome":    outcome,
-        "atr_pct":    atr / entry_price * 100 if entry_price > 0 else 0.0,
+        "outcome":     outcome,
+        "atr_pct":     atr / entry_price * 100 if entry_price > 0 else 0.0,
+        "entry_price": entry_price,
     }
 
 
@@ -246,6 +247,7 @@ class HistoricalMAEBacktest:
             if trades:
                 w = [t for t in trades if t["win"]]
                 l = [t for t in trades if not t["win"]]
+                eq = self._equity_stats(trades)
                 per_pair[name] = {
                     "simulated_trades": len(trades),
                     "wins":   len(w),
@@ -253,7 +255,8 @@ class HistoricalMAEBacktest:
                     "avg_mae_win":  round(sum(t["mae_pct"] for t in w) / max(len(w), 1), 3),
                     "avg_mae_loss": round(sum(t["mae_pct"] for t in l) / max(len(l), 1), 3),
                     "avg_mfe_win":  round(sum(t["mfe_pct"] for t in w) / max(len(w), 1), 3),
-                    "tf": tf_label,
+                    "tf":           tf_label,
+                    "equity":       eq,
                 }
             else:
                 per_pair[name] = {"simulated_trades": 0, "tf": tf_label}
@@ -384,8 +387,9 @@ class HistoricalMAEBacktest:
                 tp_mult           = self.tp_mult,
             )
             if result is not None:
-                result["symbol"] = sym_clean
-                result["tf"]     = tf_label
+                result["symbol"]    = sym_clean
+                result["tf"]        = tf_label
+                result["entry_idx"] = i
                 trades.append(result)
 
         # If holdout gives too few trades, fall back to full dataset
@@ -440,8 +444,9 @@ class HistoricalMAEBacktest:
                 future_ohlc=future, sl_mult=self.sl_mult, tp_mult=self.tp_mult,
             )
             if result is not None:
-                result["symbol"] = sym_clean
-                result["tf"]     = tf_label
+                result["symbol"]    = sym_clean
+                result["tf"]        = tf_label
+                result["entry_idx"] = i
                 trades.append(result)
 
         logger.info("  %s %s: %d simulated trades (full history fallback)  (%d W / %d L)",
@@ -449,6 +454,77 @@ class HistoricalMAEBacktest:
                     sum(1 for t in trades if t["win"]),
                     sum(1 for t in trades if not t["win"]))
         return trades
+
+    # ── Equity curve statistics ───────────────────────────────────────────────
+
+    def _equity_stats(self, trades: List[dict],
+                      initial_equity: float = 100.0,
+                      risk_per_trade: float = 5.0) -> dict:
+        """
+        Simulate an equity curve from a chronological list of backtest trades.
+
+        Assumes fixed-risk sizing:
+          Win  →  +risk × (tp_mult / sl_mult)
+          Loss →  −risk
+
+        Returns peak, trough, max drawdown, win/loss streaks, final PnL, R/R.
+        """
+        if not trades:
+            return {}
+
+        rr      = self.tp_mult / self.sl_mult   # e.g. 2.0
+        equity  = initial_equity
+        peak    = initial_equity
+        trough  = initial_equity
+        running_peak = initial_equity
+
+        win_streak  = loss_streak  = 0
+        max_win_streak = max_loss_streak = 0
+        max_drawdown_abs = 0.0
+
+        # Sort by entry_idx so equity curve is chronological
+        ordered = sorted(trades, key=lambda t: t.get("entry_idx", 0))
+
+        for t in ordered:
+            if t["win"]:
+                equity      += risk_per_trade * rr
+                win_streak  += 1
+                loss_streak  = 0
+            else:
+                equity      -= risk_per_trade
+                loss_streak += 1
+                win_streak   = 0
+
+            max_win_streak  = max(max_win_streak,  win_streak)
+            max_loss_streak = max(max_loss_streak, loss_streak)
+            peak   = max(peak,   equity)
+            trough = min(trough, equity)
+
+            # Running drawdown
+            running_peak = max(running_peak, equity)
+            dd = running_peak - equity
+            max_drawdown_abs = max(max_drawdown_abs, dd)
+
+        wins   = sum(1 for t in trades if     t["win"])
+        losses = sum(1 for t in trades if not t["win"])
+
+        return {
+            "initial_equity":    round(initial_equity, 2),
+            "final_equity":      round(equity, 2),
+            "total_pnl":         round(equity - initial_equity, 2),
+            "total_pnl_pct":     round((equity - initial_equity) / initial_equity * 100, 1),
+            "peak_equity":       round(peak, 2),
+            "trough_equity":     round(trough, 2),
+            "max_drawdown_abs":  round(max_drawdown_abs, 2),
+            "max_drawdown_pct":  round(max_drawdown_abs / initial_equity * 100, 1),
+            "max_win_streak":    max_win_streak,
+            "max_loss_streak":   max_loss_streak,
+            "rr_ratio":          round(rr, 2),
+            "win_rate_pct":      round(wins / max(len(trades), 1) * 100, 1),
+            "total_trades":      len(trades),
+            "wins":              wins,
+            "losses":            losses,
+        }
 
     # ── Optimisation ─────────────────────────────────────────────────────────
 
@@ -530,13 +606,26 @@ class HistoricalMAEBacktest:
         if not sym_sl_suggestions:
             logger.info("📐 Historical MAE: no symbols passed the sanity check — "
                         "keeping current SL mult (%.2f).", self.sl_mult)
-            return {
-                "simulated_trades": len(all_trades),
+            overall_equity = self._equity_stats(all_trades)
+            skip_result = {
+                "simulated_trades":      len(all_trades),
+                "wins":                  len([t for t in all_trades if t["win"]]),
+                "losses":                len([t for t in all_trades if not t["win"]]),
                 "suggested_sl_atr_mult": self.sl_mult,
                 "suggested_tp_atr_mult": self.tp_mult,
-                "per_pair": per_pair,
-                "skipped_calibration": True,
+                "current_sl_atr_mult":   self.sl_mult,
+                "current_tp_atr_mult":   self.tp_mult,
+                "per_pair":              per_pair,
+                "overall_equity":        overall_equity,
+                "skipped_calibration":   True,
+                "per_symbol_sl_mults":   [],
+                "win_mae_p50": 0, "win_mae_p80": 0, "loss_mae_p50": 0,
+                "wick_breach_rate": 0, "wick_win_rate": 0, "wick_loss_rate": 0,
+                "p70_mfe_winner": 0, "confidence": confidence,
+                "symbols_calibrated": 0,
             }
+            self._log_report(skip_result)
+            return skip_result
 
         # ── Aggregate: median of per-symbol suggestions ───────────────────────
         sym_sl_suggestions.sort()
@@ -577,6 +666,8 @@ class HistoricalMAEBacktest:
         all_loss_maes = sorted(t["mae_pct"] for t in losers_all)
         all_win_mfes  = [t["mfe_pct"] for t in winners_all]
 
+        overall_equity = self._equity_stats(all_trades)
+
         result = {
             "simulated_trades":      n,
             "wins":                  len(winners_all),
@@ -596,6 +687,7 @@ class HistoricalMAEBacktest:
             "p70_mfe_winner":        round(_percentile(sorted(all_win_mfes), 70), 3) if all_win_mfes else 0,
             "confidence":            confidence,
             "per_pair":              per_pair,
+            "overall_equity":        overall_equity,
         }
 
         self._log_report(result)
@@ -642,16 +734,45 @@ class HistoricalMAEBacktest:
         elif r["wick_win_rate"] > 50:
             logger.info("  ⚠️  Entry wick often breached by winners — placing SL there may be too tight")
 
+        # ── Equity curve summary ──────────────────────────────────────────────
+        eq = r.get("overall_equity", {})
+        if eq:
+            logger.info("")
+            logger.info("  ── Equity simulation  (£%.0f start, £5 risk/trade, %.1f:1 R/R) ──",
+                        eq.get("initial_equity", 100), eq.get("rr_ratio", 2.0))
+            logger.info("  Win rate     : %.1f%%  (%dW / %dL  from %d trades)",
+                        eq["win_rate_pct"], eq["wins"], eq["losses"], eq["total_trades"])
+            logger.info("  Final equity : £%.2f  (P&L %+.2f  /  %+.1f%%)",
+                        eq["final_equity"], eq["total_pnl"], eq["total_pnl_pct"])
+            logger.info("  Peak         : £%.2f      Trough       : £%.2f",
+                        eq["peak_equity"], eq["trough_equity"])
+            logger.info("  Max drawdown : £%.2f  (%.1f%% of starting capital)",
+                        eq["max_drawdown_abs"], eq["max_drawdown_pct"])
+            logger.info("  Best streak  : %d wins in a row",  eq["max_win_streak"])
+            logger.info("  Worst streak : %d losses in a row", eq["max_loss_streak"])
+
         logger.info("")
         logger.info("  ── Per-pair breakdown ────────────────────────────────")
         for name, ps in r["per_pair"].items():
             if ps.get("simulated_trades", 0) > 0:
-                logger.info("  %-20s  tf=%-4s  trades=%-4d  MAE_W=%.3f%%  MAE_L=%.3f%%  MFE_W=%.3f%%",
+                logger.info("  %-8s  tf=%-4s  trades=%-4d  W/L=%d/%d  MAE_W=%.3f%%  MFE_W=%.3f%%",
                             name, ps.get("tf", "?"), ps["simulated_trades"],
-                            ps.get("avg_mae_win", 0), ps.get("avg_mae_loss", 0),
-                            ps.get("avg_mfe_win", 0))
+                            ps.get("wins", 0), ps.get("losses", 0),
+                            ps.get("avg_mae_win", 0), ps.get("avg_mfe_win", 0))
+                eq_p = ps.get("equity", {})
+                if eq_p:
+                    logger.info("            P&L=%+.2f (%.1f%%)  Peak=£%.2f  Trough=£%.2f  "
+                                "MaxDD=£%.2f (%.1f%%)  BestRun=%d  WorstRun=%d",
+                                eq_p.get("total_pnl", 0),
+                                eq_p.get("total_pnl_pct", 0),
+                                eq_p.get("peak_equity", 0),
+                                eq_p.get("trough_equity", 0),
+                                eq_p.get("max_drawdown_abs", 0),
+                                eq_p.get("max_drawdown_pct", 0),
+                                eq_p.get("max_win_streak", 0),
+                                eq_p.get("max_loss_streak", 0))
             else:
-                logger.info("  %-20s  tf=%-4s  no data", name, ps.get("tf", "?"))
+                logger.info("  %-8s  tf=%-4s  no data", name, ps.get("tf", "?"))
 
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
