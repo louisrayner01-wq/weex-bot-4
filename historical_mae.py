@@ -549,6 +549,11 @@ class HistoricalMAEBacktest:
         sym_sl_suggestions: List[float] = []
         sym_tp_suggestions: List[float] = []
 
+        # Confidence is based on total trade count — compute early so it's
+        # available in the early-return path (before the per-symbol loop).
+        n = len(all_trades)
+        confidence = "high" if n >= 100 else "medium" if n >= 30 else "low"
+
         # Group trades by symbol+TF
         groups: Dict[str, List[dict]] = {}
         for t in all_trades:
@@ -658,9 +663,6 @@ class HistoricalMAEBacktest:
         wick_rate   = wick_total / max(len(all_trades), 1) * 100
         wick_win_r  = wick_win   / max(len(winners_all), 1) * 100
         wick_loss_r = wick_loss  / max(len(losers_all),  1) * 100
-
-        n = len(all_trades)
-        confidence = "high" if n >= 100 else "medium" if n >= 30 else "low"
 
         all_win_maes  = sorted(t["mae_pct"] for t in winners_all)
         all_loss_maes = sorted(t["mae_pct"] for t in losers_all)
