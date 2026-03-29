@@ -108,5 +108,8 @@ data:
   # Analysis results older than this many days trigger a fresh analysis run
   analysis_stale_days:  0   # 0 = always re-run (reset to 7 after first good run)
 
-
+  # Hard cap on signal timeframe — analysis may recommend 1d for ETH/SOL but
+  # daily candles give only 730 samples which isn't enough for reliable models.
+  # 4h gives ~4380 candles for all symbols (same as BTC) and is the sweet spot.
+  max_signal_tf_minutes: 240   # Never assign a TF slower than 4h
 
