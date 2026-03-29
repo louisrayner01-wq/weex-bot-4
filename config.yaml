@@ -86,7 +86,8 @@ strategy:
   # ── Labelling ──────────────────────────────────────────────────────────────
   min_training_samples:  60    # Don't train until we have at least 60 labelled samples
   label_horizon_candles:  4    # Look 4 candles forward to label BUY / HOLD / SELL
-  label_move_threshold: 0.010  # 1.0 % move — generates more BUY/SELL labels, reduces HOLD dominance
+  label_move_threshold: 0.015  # Fallback only — per-TF thresholds in strategy.py take priority
+                               # (5m=0.3%, 15m=0.5%, 1h=0.8%, 4h=1.5%, 1d=2.0%)
 
 logging:
   log_file:    "logs/bot.log"
