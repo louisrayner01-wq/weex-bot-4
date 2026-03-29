@@ -16,8 +16,8 @@ defined in INITIAL_FETCH_DAYS.  This gives every model 2 years of training
 data right from the first deployment.
 
 Target windows:
-  5m  → 60 days   (~17 280 candles — used for monitoring, not training)
-  15m → 730 days  (~70 080 candles — ETH training timeframe)
+  5m  → 730 days  (~210 240 candles — full training dataset, same as all TFs)
+  15m → 730 days  (~70 080 candles)
   1h  → 730 days  (~17 520 candles)
   4h  → 730 days  (~4 380 candles  — BTC/SOL training timeframe)
   1d  → 730 days  (~730 candles)
@@ -80,14 +80,14 @@ TF_REFRESH_MINUTES = {
 }
 
 # How many days of history to fetch on the very first run (no CSV exists).
-# Shorter timeframes accumulate fast, so 5m is capped at 60 days to avoid
-# thousands of API calls on first boot.
+# All timeframes now fetch 2 years so the analysis can freely compare 5m
+# against 15m/1h/4h without penalising shorter candles for having less data.
 INITIAL_FETCH_DAYS = {
-    "5":     60,   # ~17 280 candles in ~18 batches  (monitoring only)
-    "15":   730,   # ~70 080 candles in ~71 batches  (ETH training tf)
-    "60":   730,   # ~17 520 candles in ~18 batches
-    "240":  730,   # ~4 380 candles in  ~5 batches   (BTC/SOL training tf)
-    "1440": 730,   # ~730   candles in   1 batch
+    "5":    730,   # ~210 240 candles in ~211 batches — full 2-year training set
+    "15":   730,   # ~70 080 candles  in  ~71 batches
+    "60":   730,   # ~17 520 candles  in  ~18 batches
+    "240":  730,   # ~4 380 candles   in   ~5 batches
+    "1440": 730,   # ~730 candles     in    1 batch
 }
 
 # 200 candles per request — conservative limit that works reliably with
@@ -169,8 +169,8 @@ class DataCollector:
         # If the oldest candle in the CSV is more than 30 days newer than our
         # 2-year target, the data is too thin for good model training.
         # We backfill by paginating backwards and merging with the existing CSV.
-        # Skip for 5m — it is monitoring-only and doesn't need 2 years of data.
-        if timeframe_min != "5" and existing is not None and not existing.empty:
+        # Applies to ALL timeframes including 5m — 5m now has a full 2-year target.
+        if existing is not None and not existing.empty:
             target_start = (pd.Timestamp.now('UTC').tz_localize(None)
                             - pd.Timedelta(days=days))
             oldest_candle = existing["timestamp"].min()
@@ -400,6 +400,7 @@ if __name__ == "__main__":
     data_dir = cfg.get("data", {}).get("data_dir", "/data")
     collector = DataCollector(client, data_dir=data_dir)
     collector.collect_all()
+
 
 
 
