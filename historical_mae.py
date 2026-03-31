@@ -481,6 +481,7 @@ class HistoricalMAEBacktest:
         win_streak  = loss_streak  = 0
         max_win_streak = max_loss_streak = 0
         max_drawdown_abs = 0.0
+        peak_at_max_dd   = initial_equity   # running_peak snapshot when max_dd was set
 
         # Sort by entry_idx so equity curve is chronological
         ordered = sorted(trades, key=lambda t: t.get("entry_idx", 0))
@@ -500,10 +501,12 @@ class HistoricalMAEBacktest:
             peak   = max(peak,   equity)
             trough = min(trough, equity)
 
-            # Running drawdown
+            # Running drawdown — track the peak that produced it for a meaningful %
             running_peak = max(running_peak, equity)
             dd = running_peak - equity
-            max_drawdown_abs = max(max_drawdown_abs, dd)
+            if dd > max_drawdown_abs:
+                max_drawdown_abs = dd
+                peak_at_max_dd   = running_peak
 
         wins   = sum(1 for t in trades if     t["win"])
         losses = sum(1 for t in trades if not t["win"])
@@ -516,7 +519,8 @@ class HistoricalMAEBacktest:
             "peak_equity":       round(peak, 2),
             "trough_equity":     round(trough, 2),
             "max_drawdown_abs":  round(max_drawdown_abs, 2),
-            "max_drawdown_pct":  round(max_drawdown_abs / initial_equity * 100, 1),
+            # % expressed relative to the peak at the time of the drawdown (not initial capital)
+            "max_drawdown_pct":  round(max_drawdown_abs / peak_at_max_dd * 100, 1) if peak_at_max_dd > 0 else 0.0,
             "max_win_streak":    max_win_streak,
             "max_loss_streak":   max_loss_streak,
             "rr_ratio":          round(rr, 2),
@@ -748,7 +752,7 @@ class HistoricalMAEBacktest:
                         eq["final_equity"], eq["total_pnl"], eq["total_pnl_pct"])
             logger.info("  Peak         : £%.2f      Trough       : £%.2f",
                         eq["peak_equity"], eq["trough_equity"])
-            logger.info("  Max drawdown : £%.2f  (%.1f%% of starting capital)",
+            logger.info("  Max drawdown : £%.2f  (%.1f%% from peak)",
                         eq["max_drawdown_abs"], eq["max_drawdown_pct"])
             logger.info("  Best streak  : %d wins in a row",  eq["max_win_streak"])
             logger.info("  Worst streak : %d losses in a row", eq["max_loss_streak"])
