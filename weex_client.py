@@ -50,6 +50,8 @@ FUTURES_ENDPOINTS = {
     "open_orders":   "/capi/v3/order/current",
     # Contract OHLCV candles — plain symbol, interval param, same format as spot
     "candles":       "/capi/v3/market/klines",
+    # Contract mark/last price ticker — returns markPrice, lastPr, indexPrice
+    "ticker":        "/capi/v3/market/ticker",
 }
 
 # Map our minute-based timeframe config values → Weex spot interval strings
@@ -200,10 +202,31 @@ class WeexClient:
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
         """Return current price data for a symbol.
-        Tries v3 ticker then v2 spot ticker; returns None quietly if both fail
-        so callers can fall back to candle close price without noisy log spam.
+
+        For futures (_UMCBL / _DMCBL) symbols, queries the contract ticker
+        endpoint first (returns markPrice, lastPr, indexPrice).  Falls back
+        to the spot ticker endpoints if the contract call fails.
+
+        Returns None quietly if all endpoints fail so callers can fall back
+        to the last candle close without noisy log spam.
         """
         sym = _market_symbol(symbol)
+        is_futures = "_UMCBL" in symbol or "_DMCBL" in symbol
+
+        # For futures, try the contract domain ticker first.
+        # The _get() router sends /capi/ paths to CONTRACT_BASE_URL automatically.
+        if is_futures:
+            data   = self._get(FUTURES_ENDPOINTS["ticker"], {"symbol": sym}, auth=False)
+            result = data.get("data")
+            if result:
+                if isinstance(result, list):
+                    for item in result:
+                        if item.get("symbol") == sym:
+                            return item
+                else:
+                    return result
+
+        # Spot fallback (also used for non-futures symbols)
         for endpoint in (ENDPOINTS["ticker"], ENDPOINTS["ticker_v2"]):
             data = self._get(endpoint, {"symbol": sym}, auth=False)
             result = data.get("data")
@@ -390,3 +413,4 @@ class WeexClient:
         """Quick connectivity check using public ticker endpoint."""
         result = self.get_ticker("BTCUSDT")
         return result is not None
+
