@@ -32,6 +32,7 @@ Run with: python bot.py
 import time
 import logging
 import os
+import json
 import yaml
 from datetime import datetime, timezone
 
@@ -220,6 +221,31 @@ class TradingBot:
         return candles_to_df(raw)
 
     def live_price(self, symbol: str, df: pd.DataFrame) -> float:
+        """
+        Returns the current live mark price from the Weex ticker.
+
+        For futures (_UMCBL) symbols this is the contract markPrice — the same
+        price shown on the Weex futures UI and used for PnL/liquidation.
+        Falls back to the last closed candle's close price if the ticker call
+        fails (e.g. network blip), so the bot keeps running rather than
+        crashing.
+
+        Using the live price means entry price, SL, TP, and position sizing
+        are all anchored to the real market price at signal time — not a
+        candle that may have closed up to 15 minutes ago.
+        """
+        tick = self.client.get_ticker(symbol)
+        if tick:
+            # Prefer markPrice for futures (fair value); fall back to lastPr / last
+            for field in ("markPrice", "lastPr", "last", "close"):
+                val = tick.get(field)
+                if val:
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+        # Fallback: last closed candle close
+        self.log.debug("Ticker unavailable for %s — using candle close as price", symbol)
         return float(df["close"].iloc[-1])
 
     def get_equity(self) -> float:
@@ -555,21 +581,68 @@ class TradingBot:
                           "need %d+ trades to auto-apply (have %d)",
                           suggested, current_mult, MIN_TRADES_FOR_AUTO, n_trades)
 
+    def _apply_mae_result(self, result: dict) -> None:
+        """Apply SL/TP multipliers from a historical MAE result dict."""
+        if not result or result.get("simulated_trades", 0) < 15:
+            self.log.info("📐 Historical MAE: insufficient data — "
+                          "will calibrate from live trades once they accumulate.")
+            return
+
+        suggested_sl = result.get("suggested_sl_atr_mult")
+        suggested_tp = result.get("suggested_tp_atr_mult")
+        conf         = result.get("confidence", "low")
+
+        sl_tol = 0.05 if conf == "high" else 0.15
+        if suggested_sl and abs(suggested_sl - self.risk.sl_atr_mult) > sl_tol:
+            old = self.risk.sl_atr_mult
+            self.risk.sl_atr_mult = suggested_sl
+            self.log.info("⚙️  Historical MAE → sl_atr_mult: %.2f → %.2f  [%s confidence]",
+                          old, suggested_sl, conf)
+        else:
+            self.log.info("⚙️  Historical MAE: SL unchanged (%.2f) — already well-calibrated",
+                          self.risk.sl_atr_mult)
+
+        if suggested_tp and suggested_tp >= self.risk.sl_atr_mult * 1.5:
+            old = self.risk.tp_atr_mult
+            self.risk.tp_atr_mult = suggested_tp
+            self.log.info("⚙️  Historical MAE → tp_atr_mult: %.2f → %.2f  [%s confidence]",
+                          old, suggested_tp, conf)
+
     def _run_historical_mae(self):
         """
         Walk-forward MAE/MFE backtest on historical CSV data.
-        Runs ONCE at startup (after _initial_train) so the bot has a
-        data-driven SL calibration before trade #1 is ever opened.
 
-        Unlike _run_mae_analysis() (which reads the live trade log),
-        this uses price history to simulate hundreds of entries and
-        measures how far the market typically moves against the signal
-        before resolving — giving an evidence-based starting SL.
+        Results are cached to mae_backtest_results.json and re-used on every
+        startup until they are older than analysis_stale_days (default 7 days).
+        This means the expensive backtest only re-runs when the model is
+        genuinely stale — not on every Railway redeploy.
 
-        The suggested multipliers are applied immediately (no minimum
-        trade count needed) because they come from real price data,
-        not a live performance log.
+        The cache is skipped and a fresh run is forced if:
+          • the JSON file does not exist
+          • the file is older than analysis_stale_days
+          • the file is unreadable / corrupt
         """
+        cache_path = os.path.join(self.data_dir, "mae_backtest_results.json")
+        stale_days = self.cfg.get("data", {}).get("analysis_stale_days", 7)
+
+        # ── Try cache first ───────────────────────────────────────────────────
+        if os.path.exists(cache_path):
+            age_days = (time.time() - os.path.getmtime(cache_path)) / 86400
+            if age_days < stale_days:
+                try:
+                    with open(cache_path) as f:
+                        cached = json.load(f)
+                    self.log.info(
+                        "📐 Historical MAE: using cached results "
+                        "(%.1f days old — re-runs after %d days)",
+                        age_days, stale_days,
+                    )
+                    self._apply_mae_result(cached)
+                    return
+                except Exception as exc:
+                    self.log.warning("MAE cache unreadable (%s) — re-running backtest", exc)
+
+        # ── Run backtest ──────────────────────────────────────────────────────
         self.log.info("📐 Running historical MAE backtest…")
         result = run_historical_mae(
             strategy   = self.strategy,
@@ -580,33 +653,17 @@ class TradingBot:
             tp_mult    = self.risk.tp_atr_mult,
         )
 
-        if not result or result.get("simulated_trades", 0) < 15:
-            self.log.info("📐 Historical MAE: insufficient data — "
-                          "will calibrate from live trades once they accumulate.")
-            return
+        # ── Cache results so future startups skip the heavy computation ───────
+        if result and result.get("simulated_trades", 0) >= 15:
+            try:
+                os.makedirs(self.data_dir, exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump(result, f, indent=2)
+                self.log.info("📐 MAE results saved → %s", cache_path)
+            except Exception as exc:
+                self.log.warning("Could not save MAE cache: %s", exc)
 
-        suggested_sl = result.get("suggested_sl_atr_mult")
-        suggested_tp = result.get("suggested_tp_atr_mult")
-        conf         = result.get("confidence", "low")
-
-        # Apply SL suggestion — always apply from historical data, but widen
-        # the tolerance slightly for low-confidence estimates
-        sl_tol = 0.05 if conf == "high" else 0.15   # only apply if diff > tol
-        if suggested_sl and abs(suggested_sl - self.risk.sl_atr_mult) > sl_tol:
-            old = self.risk.sl_atr_mult
-            self.risk.sl_atr_mult = suggested_sl
-            self.log.info("⚙️  Historical MAE → sl_atr_mult: %.2f → %.2f  [%s confidence]",
-                          old, suggested_sl, conf)
-        else:
-            self.log.info("⚙️  Historical MAE: SL unchanged (%.2f) — already well-calibrated",
-                          self.risk.sl_atr_mult)
-
-        # Apply TP suggestion (only if it improves R/R relative to new SL)
-        if suggested_tp and suggested_tp >= self.risk.sl_atr_mult * 1.5:
-            old = self.risk.tp_atr_mult
-            self.risk.tp_atr_mult = suggested_tp
-            self.log.info("⚙️  Historical MAE → tp_atr_mult: %.2f → %.2f  [%s confidence]",
-                          old, suggested_tp, conf)
+        self._apply_mae_result(result or {})
 
     # ── LTF reversal detector ─────────────────────────────────────────────────
 
@@ -1044,7 +1101,6 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
-
 
 
 
