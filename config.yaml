@@ -16,17 +16,16 @@ trading:
     - symbol:     "BTCUSDT_UMCBL"
       name:       "BTC"
       enabled:    true
-      allocation: 0.50       # 50 % of capital starts on BTC
+      allocation: 0.50       # 50 % of capital on BTC
 
     - symbol:     "ETHUSDT_UMCBL"
       name:       "ETH"
       enabled:    true
-      allocation: 0.30
+      allocation: 0.50       # 50 % of capital on ETH
 
     - symbol:     "SOLUSDT_UMCBL"
       name:       "SOL"
-      enabled:    true
-      allocation: 0.20
+      enabled:    false      # Disabled — 44.7% win rate / 32-loss streak weaker than BTC/ETH
 
   timeframe:              "15"   # Signal candle granularity (minutes) — 15m proven at 48%+ win rate
   lookback_candles:       300    # Candles fetched per request
@@ -122,5 +121,4 @@ data:
   # a wider TF range produces better live performance.
   min_signal_tf_minutes: 5     # Allow 5m (data available, lower CV used as fallback)
   max_signal_tf_minutes: 15    # Cap at 15m — proven win rates, ~23k training samples
-
 
