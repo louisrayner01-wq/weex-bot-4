@@ -133,8 +133,9 @@ class RiskManager:
         else:
             price_move = pos.entry_price - exit_price
 
-        pnl_usdt = close_qty * price_move * pos.leverage
-        pnl_pct  = price_move / pos.entry_price * pos.leverage
+        # Same fix: qty already sized for 1× risk — do not multiply by leverage.
+        pnl_usdt = close_qty * price_move
+        pnl_pct  = price_move / pos.entry_price
 
         self.equity = max(self.equity + pnl_usdt, 0.0)
 
@@ -312,9 +313,12 @@ class RiskManager:
         else:
             price_move = pos.entry_price - exit_price
 
-        # Actual £ PnL: qty × price_move × leverage
-        pnl_usdt = pos.quantity * price_move * pos.leverage
-        pnl_pct  = price_move / pos.entry_price * pos.leverage
+        # Actual £ PnL: qty × price_move
+        # NOTE: qty is already sized so that qty × stop_distance = £5 risk at 1×.
+        # Leverage is only needed for the exchange margin calculation — do NOT
+        # multiply here or the PnL will be overstated by the leverage factor.
+        pnl_usdt = pos.quantity * price_move
+        pnl_pct  = price_move / pos.entry_price
 
         self.equity = max(self.equity + pnl_usdt, 0.0)
 
