@@ -926,16 +926,14 @@ class TradingBot:
 
     def scan_entries(self):
         """
-        Lightweight entry scan that runs every entry_scan_interval_s (15 min)
-        when the bot has no open positions.
+        Lightweight entry scan that runs every entry_scan_interval_s (15 min).
 
-        Fetches the latest candles and evaluates the ML signal + confluence
-        filter for each pair. If a signal passes all gates, opens the trade.
-        No retraining or performance summaries — just entry hunting.
+        Evaluates every pair independently — BTC and ETH can both have open
+        positions at the same time, matching the backtest behaviour.  Each
+        pair is skipped individually if it already has an open position;
+        the scan is never halted globally just because one pair is active.
+        The risk manager's max_open_positions cap (2) is the hard limit.
         """
-        if self.risk.open_positions:
-            return   # already in a trade; monitor_exits handles everything
-
         if self.risk.trading_halted():
             return
 
