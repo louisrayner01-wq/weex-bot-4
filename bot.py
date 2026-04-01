@@ -625,6 +625,15 @@ class TradingBot:
         cache_path = os.path.join(self.data_dir, "mae_backtest_results.json")
         stale_days = self.cfg.get("data", {}).get("analysis_stale_days", 7)
 
+        # ── FORCE_MAE_RERUN: delete cache and re-run fresh ────────────────────
+        if os.getenv("FORCE_MAE_RERUN", "false").lower() == "true":
+            if os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                    self.log.info("♻️  FORCE_MAE_RERUN=true — deleted MAE cache, will re-run backtest")
+                except Exception as exc:
+                    self.log.warning("Could not delete MAE cache: %s", exc)
+
         # ── Try cache first ───────────────────────────────────────────────────
         if os.path.exists(cache_path):
             age_days = (time.time() - os.path.getmtime(cache_path)) / 86400
@@ -644,13 +653,23 @@ class TradingBot:
 
         # ── Run backtest ──────────────────────────────────────────────────────
         self.log.info("📐 Running historical MAE backtest…")
+        # Read thresholds from config so backtest and live bot always match
+        strat_cfg   = self.cfg.get("strategy", {})
+        buy_thresh  = strat_cfg.get("buy_threshold",  0.45)
+        sell_thresh = strat_cfg.get("sell_threshold", 0.35)
+        # HTF is one step up from the current signal TF (matches _sym_htf logic)
+        HTF_UP     = {"5": "60", "15": "60", "60": "240", "240": "1440", "1440": "1440"}
+        htf_tf_min = HTF_UP.get(self.tf, "60")
         result = run_historical_mae(
-            strategy   = self.strategy,
-            symbol_tf  = self.symbol_tf,
-            pairs      = self.pairs,
-            data_dir   = self.data_dir,
-            sl_mult    = self.risk.sl_atr_mult,
-            tp_mult    = self.risk.tp_atr_mult,
+            strategy    = self.strategy,
+            symbol_tf   = self.symbol_tf,
+            pairs       = self.pairs,
+            data_dir    = self.data_dir,
+            sl_mult     = self.risk.sl_atr_mult,
+            tp_mult     = self.risk.tp_atr_mult,
+            buy_thresh  = buy_thresh,
+            sell_thresh = sell_thresh,
+            htf_tf_min  = htf_tf_min,
         )
 
         # ── Cache results so future startups skip the heavy computation ───────
@@ -1099,8 +1118,6 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot("config.yaml")
     bot.run()
-
-
 
 
 
