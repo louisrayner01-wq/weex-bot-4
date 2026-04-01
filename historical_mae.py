@@ -208,12 +208,15 @@ class HistoricalMAEBacktest:
                  sl_mult:     float = 1.5,
                  tp_mult:     float = 3.0,
                  buy_thresh:  float = DEFAULT_BUY_THRESHOLD,
-                 sell_thresh: float = DEFAULT_SELL_THRESHOLD):
+                 sell_thresh: float = DEFAULT_SELL_THRESHOLD,
+                 htf_tf_min:  str   = "60"):
         self.data_dir    = data_dir
         self.sl_mult     = sl_mult
         self.tp_mult     = tp_mult
         self.buy_thresh  = buy_thresh
         self.sell_thresh = sell_thresh
+        # Higher timeframe used for confluence filtering (same as live bot)
+        self.htf_tf_min  = htf_tf_min
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -340,6 +343,23 @@ class HistoricalMAEBacktest:
             logger.info("  %s %s: not enough holdout candles", sym_clean, tf_label)
             return []
 
+        # ── Load HTF data for confluence filter (mirrors live bot behaviour) ────
+        # For every signal candle at index i, we look up the corresponding
+        # HTF candle and suppress signals that fight the HTF trend —
+        # exactly what apply_confluence() does in the live bot.
+        df_htf    = None
+        htf_ratio = 1
+        if self.htf_tf_min and self.htf_tf_min != tf_min:
+            htf_label = _TF_LABEL.get(self.htf_tf_min, "1h")
+            htf_csv   = os.path.join(self.data_dir, f"{sym_clean}_{htf_label}.csv")
+            if os.path.exists(htf_csv):
+                try:
+                    df_htf    = pd.read_csv(htf_csv)
+                    htf_ratio = max(1, int(self.htf_tf_min) // int(tf_min))
+                except Exception as exc:
+                    logger.debug("Could not load HTF CSV %s: %s", htf_csv, exc)
+                    df_htf = None
+
         # ── Walk-forward through holdout window ───────────────────────────────
         trades: List[dict] = []
 
@@ -367,6 +387,17 @@ class HistoricalMAEBacktest:
                 signal = "short"
             else:
                 continue   # HOLD
+
+            # ── HTF confluence filter (matches live apply_confluence logic) ───
+            if df_htf is not None:
+                htf_i      = min(i // htf_ratio, len(df_htf) - 1)
+                htf_window = df_htf.iloc[max(0, htf_i - 49): htf_i + 1]
+                htf_dir    = strategy.htf_trend(htf_window)
+                # Suppress signal if it contradicts the HTF trend
+                if signal == "long"  and htf_dir == -1:
+                    continue   # bearish 1h suppresses BUY — same as live
+                if signal == "short" and htf_dir ==  1:
+                    continue   # bullish 1h suppresses SELL — same as live
 
             # Entry data from the raw (non-feature) row
             entry_price = float(df.iloc[i]["close"])
@@ -396,7 +427,7 @@ class HistoricalMAEBacktest:
         if len(trades) < MIN_SIM_TRADES:
             logger.info("  %s %s: holdout gave %d trades — retrying on full history",
                         sym_clean, tf_label, len(trades))
-            return self._backtest_full(df, df_feat, model, scaler, feats, classes,
+            return self._backtest_full(strategy, df, df_feat, model, scaler, feats, classes,
                                        sym_clean, tf_label, tf_min, max_hold)
 
         logger.info("  %s %s: %d simulated trades  (%d W / %d L)  from holdout",
@@ -405,9 +436,23 @@ class HistoricalMAEBacktest:
                     sum(1 for t in trades if not t["win"]))
         return trades
 
-    def _backtest_full(self, df, df_feat, model, scaler, feats, classes,
+    def _backtest_full(self, strategy, df, df_feat, model, scaler, feats, classes,
                        sym_clean, tf_label, tf_min, max_hold) -> List[dict]:
         """Fallback: run simulation over the whole dataset (with minor look-ahead)."""
+
+        # Load HTF data for confluence (same as holdout path)
+        df_htf    = None
+        htf_ratio = 1
+        if self.htf_tf_min and self.htf_tf_min != tf_min:
+            htf_label = _TF_LABEL.get(self.htf_tf_min, "1h")
+            htf_csv   = os.path.join(self.data_dir, f"{sym_clean}_{htf_label}.csv")
+            if os.path.exists(htf_csv):
+                try:
+                    df_htf    = pd.read_csv(htf_csv)
+                    htf_ratio = max(1, int(self.htf_tf_min) // int(tf_min))
+                except Exception:
+                    df_htf = None
+
         trades: List[dict] = []
         sim_end = len(df_feat) - max_hold - 1
 
@@ -431,6 +476,16 @@ class HistoricalMAEBacktest:
                 signal = "short"
             else:
                 continue
+
+            # HTF confluence filter
+            if df_htf is not None:
+                htf_i      = min(i // htf_ratio, len(df_htf) - 1)
+                htf_window = df_htf.iloc[max(0, htf_i - 49): htf_i + 1]
+                htf_dir    = strategy.htf_trend(htf_window)
+                if signal == "long"  and htf_dir == -1:
+                    continue
+                if signal == "short" and htf_dir ==  1:
+                    continue
 
             entry_price = float(df.iloc[i]["close"])
             candle_low  = float(df.iloc[i]["low"])
@@ -814,19 +869,28 @@ def _find_threshold(win_maes: list, loss_maes: list,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_historical_mae(strategy, symbol_tf: dict, pairs: list,
-                       data_dir: str = "/data",
-                       sl_mult: float = 1.5,
-                       tp_mult: float = 3.0) -> dict:
+                       data_dir:    str   = "/data",
+                       sl_mult:     float = 1.5,
+                       tp_mult:     float = 3.0,
+                       buy_thresh:  float = DEFAULT_BUY_THRESHOLD,
+                       sell_thresh: float = DEFAULT_SELL_THRESHOLD,
+                       htf_tf_min:  str   = "60") -> dict:
     """
     Top-level helper. Instantiates HistoricalMAEBacktest and runs it.
     Returns the result dict (empty dict if not enough data).
+
+    buy_thresh / sell_thresh should be passed from the live config so the
+    backtest uses identical thresholds to the live bot.
+    htf_tf_min is the higher timeframe used for confluence filtering
+    (e.g. "60" for 1h when signal TF is 15m).
     """
     bt = HistoricalMAEBacktest(
-        data_dir   = data_dir,
-        sl_mult    = sl_mult,
-        tp_mult    = tp_mult,
-        buy_thresh = DEFAULT_BUY_THRESHOLD,
-        sell_thresh= DEFAULT_SELL_THRESHOLD,
+        data_dir    = data_dir,
+        sl_mult     = sl_mult,
+        tp_mult     = tp_mult,
+        buy_thresh  = buy_thresh,
+        sell_thresh = sell_thresh,
+        htf_tf_min  = htf_tf_min,
     )
     try:
         return bt.run(strategy, symbol_tf, pairs)
@@ -865,3 +929,4 @@ if __name__ == "__main__":
     if result:
         print(f"\nSuggested sl_atr_mult : {result.get('suggested_sl_atr_mult', 'N/A')}")
         print(f"Suggested tp_atr_mult : {result.get('suggested_tp_atr_mult', 'N/A')}")
+
